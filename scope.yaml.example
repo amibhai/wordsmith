@@ -1,0 +1,27 @@
+# wordsmith scope.yaml — EXAMPLE FILE
+# Copy to scope.yaml and edit before targeting any system.
+# LEGAL: You MUST have written authorization before using wordsmith on any target.
+
+engagement:
+  name: "Client Name Pentest Q3 2026"
+  authorized_by: "John Smith, CISO"
+  authorization_date: "2026-06-01"
+  expiry_date: "2026-07-01"
+
+targets:
+  domains:
+    - "example.com"
+    - "*.example.com"
+    - "staging.example.com"
+  ip_ranges:
+    - "192.168.1.0/24"
+  emails:
+    - "@example.com"
+
+restrictions:
+  max_wordlist_size_mb: 500
+  allowed_modules:
+    - osint
+    - scraper
+    - mutator
+    - generator
