@@ -2,6 +2,10 @@
 
 **OSINT-seeded intelligent wordlist generator for authorized password auditing engagements.**
 
+![Python](https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square&logo=python)
+![License](https://img.shields.io/github/license/amibhai/wordsmith?style=flat-square)
+![Status](https://img.shields.io/badge/status-active-brightgreen?style=flat-square)
+
 Made by अमी — same DNA as [wifi_down](https://github.com/amibhai/wifi_down).
 
 ---
@@ -174,3 +178,5 @@ Logs are stored in `~/.wordsmith/audit/<session_id>.log`.
 ---
 
 *wordsmith is for authorized security engagements only. The author accepts no liability for misuse.*
+
+*Always obtain written authorization before running wordsmith against any target. Unauthorized use is illegal.*
