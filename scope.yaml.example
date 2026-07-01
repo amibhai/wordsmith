@@ -5,8 +5,9 @@
 engagement:
   name: "Client Name Pentest Q3 2026"
   authorized_by: "John Smith, CISO"
-  authorization_date: "2026-06-01"
-  expiry_date: "2026-07-01"
+  authorization_date: "2026-07-01"
+  expiry_date: "2026-09-30"
+  notes: "External perimeter assessment — production environment. No DoS testing."
 
 targets:
   domains:
@@ -17,6 +18,12 @@ targets:
     - "192.168.1.0/24"
   emails:
     - "@example.com"
+
+exclude:
+  domains:
+    - "mail.example.com"   # mail server — excluded per client request
+  ip_ranges:
+    - "192.168.1.200/32"  # critical infra — hands off
 
 restrictions:
   max_wordlist_size_mb: 500
