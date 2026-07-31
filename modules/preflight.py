@@ -69,14 +69,10 @@ PIP_PACKAGES: list[tuple[str, str, str]] = [
     ("rich",         "rich",           "required"),
     ("dns",          "dnspython",      "required"),
     ("whois",        "python-whois",   "required"),
-    ("tldextract",   "tldextract",     "required"),
-    ("nltk",         "nltk",           "required"),
     ("yaml",         "pyyaml",         "required"),
     ("cryptography", "cryptography",   "required"),
     ("httpx",        "httpx",          "required"),
-    ("selenium",     "selenium",       "optional"),
-    ("scrapy",       "scrapy",         "optional"),
-    ("spacy",        "spacy",          "optional"),
+    ("pypdf",        "pypdf",          "optional"),
 ]
 
 TOOL_PACKAGES: dict[str, dict[str, Optional[str]]] = {

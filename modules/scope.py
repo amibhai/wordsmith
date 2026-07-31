@@ -42,6 +42,9 @@ class ScopeManager:
         self._domains: list[str] = []
         self._ip_networks: list[ipaddress._BaseNetwork] = []
         self._email_patterns: list[str] = []
+        self._exclude_domains: list[str] = []
+        self._exclude_ip_networks: list[ipaddress._BaseNetwork] = []
+        self._exclude_email_patterns: list[str] = []
         self._restrictions: dict = {}
         self._loaded = False
 
@@ -68,19 +71,65 @@ class ScopeManager:
                 except ValueError:
                     logger.warning("Invalid IP range in scope: %s", ip_str)
 
+            exclude = data.get("exclude", {})
+            self._exclude_domains = [d.lower() for d in exclude.get("domains", [])]
+            self._exclude_email_patterns = [e.lower() for e in exclude.get("emails", [])]
+            for ip_str in exclude.get("ip_ranges", []):
+                try:
+                    self._exclude_ip_networks.append(ipaddress.ip_network(ip_str, strict=False))
+                except ValueError:
+                    logger.warning("Invalid IP range in scope exclude: %s", ip_str)
+
             logger.info(
-                "Scope loaded: %d domains, %d IP ranges — from %s",
-                len(self._domains), len(self._ip_networks), path,
+                "Scope loaded: %d domains, %d IP ranges, %d excluded domains, "
+                "%d excluded IP ranges — from %s",
+                len(self._domains), len(self._ip_networks),
+                len(self._exclude_domains), len(self._exclude_ip_networks), path,
             )
         except Exception as exc:
             logger.error("Failed to load scope file %s: %s", path, exc)
 
     # ── Core check ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _domain_matches(target_lower: str, pattern: str) -> bool:
+        """True if target_lower is, or is a subdomain of, the (wildcard) pattern."""
+        clean_pattern = pattern.lower().lstrip("*.")
+        return target_lower == clean_pattern or target_lower.endswith("." + clean_pattern)
+
+    def _is_excluded(self, target: str) -> bool:
+        """True if target matches any exclude rule. Excludes always win over includes."""
+        raw = target.strip()
+
+        # Email exclude
+        if "@" in raw and not raw.startswith("@"):
+            domain_part = raw.split("@")[-1].lower()
+            if any(
+                domain_part == pat.lstrip("@") or raw.lower() == pat
+                for pat in self._exclude_email_patterns
+            ):
+                return True
+            raw = domain_part  # fall through to domain exclude check
+
+        # IP exclude
+        try:
+            addr = ipaddress.ip_address(raw)
+            if any(addr in net for net in self._exclude_ip_networks):
+                return True
+        except ValueError:
+            pass
+
+        # Domain exclude (with wildcard support, same semantics as includes)
+        target_lower = raw.lower().lstrip("*.")
+        return any(self._domain_matches(target_lower, p) for p in self._exclude_domains)
+
     def check_scope(self, target: str) -> bool:
         """Return True if target is authorized. Never raises — use require_scope() for hard blocking."""
         if not self._loaded:
             return True  # No scope file = warn mode, don't block
+
+        if self._is_excluded(target):
+            return False
 
         # Email pattern check
         if "@" in target and not target.startswith("@"):
@@ -103,8 +152,7 @@ class ScopeManager:
         # Domain / wildcard check
         target_lower = target.lower().lstrip("*.")
         for pattern in self._domains:
-            clean_pattern = pattern.lstrip("*.")
-            if target_lower == clean_pattern or target_lower.endswith("." + clean_pattern):
+            if self._domain_matches(target_lower, pattern):
                 return self._check_expiry()
         return False
 
@@ -119,6 +167,14 @@ class ScopeManager:
                 "  Run [bold]wordsmith --scope-wizard[/bold] to create one.[/yellow]"
             )
             return
+
+        if self._is_excluded(target):
+            raise ScopeError(
+                f"Target {target!r} is explicitly EXCLUDED in scope.yaml.\n"
+                f"It cannot be used for {operation!r} even if it matches a broader "
+                f"authorized domain/range.",
+                target=target,
+            )
 
         if not self.check_scope(target):
             raise ScopeError(
@@ -234,6 +290,40 @@ def scope_wizard(output_path: Path = DEFAULT_SCOPE_FILE) -> None:
             break
         emails.append(e)
 
+    console.print(
+        "\n[bold yellow]Exclusions[/] [dim]— anything listed here is always blocked, "
+        "even if it matches a broader domain/range above (e.g. a mail server or "
+        "critical-infra host the client carved out).[/]"
+    )
+
+    exclude_domains: list[str] = []
+    console.print("\n[dim]Add EXCLUDED domains (blank to finish):[/]")
+    while True:
+        d = input("  Excluded domain (e.g. mail.example.com): ").strip()
+        if not d:
+            break
+        exclude_domains.append(d)
+
+    exclude_ip_ranges: list[str] = []
+    console.print("\n[dim]Add EXCLUDED IP ranges (CIDR, blank to skip):[/]")
+    while True:
+        ip = input("  Excluded IP range: ").strip()
+        if not ip:
+            break
+        try:
+            ipaddress.ip_network(ip, strict=False)
+            exclude_ip_ranges.append(ip)
+        except ValueError:
+            console.print(f"  [red]Invalid CIDR: {ip}[/]")
+
+    exclude_emails: list[str] = []
+    console.print("\n[dim]Add EXCLUDED email patterns (blank to skip):[/]")
+    while True:
+        e = input("  Excluded email pattern: ").strip()
+        if not e:
+            break
+        exclude_emails.append(e)
+
     max_size_str = input("\nMax wordlist size (MB, default 500): ").strip()
     try:
         max_size_mb = int(max_size_str)
@@ -252,6 +342,11 @@ def scope_wizard(output_path: Path = DEFAULT_SCOPE_FILE) -> None:
             "ip_ranges": ip_ranges,
             "emails": emails,
         },
+        "exclude": {
+            "domains": exclude_domains,
+            "ip_ranges": exclude_ip_ranges,
+            "emails": exclude_emails,
+        },
         "restrictions": {
             "max_wordlist_size_mb": max_size_mb,
             "allowed_modules": ["osint", "scraper", "mutator", "generator"],
@@ -264,4 +359,5 @@ def scope_wizard(output_path: Path = DEFAULT_SCOPE_FILE) -> None:
     console.print(f"\n[bold green]✓ scope.yaml created:[/] {output_path.resolve()}")
     console.print(f"  Engagement: [cyan]{engagement_name}[/]")
     console.print(f"  Domains:    [cyan]{len(domains)}[/]")
+    console.print(f"  Excluded:   [cyan]{len(exclude_domains) + len(exclude_ip_ranges) + len(exclude_emails)}[/]")
     console.print(f"  Expires:    [cyan]{expiry_date}[/]")

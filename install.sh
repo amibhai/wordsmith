@@ -72,16 +72,12 @@ if [ -f "$REQ" ]; then
 else
     $PYTHON -m pip install --break-system-packages -q \
         requests beautifulsoup4 rich dnspython python-whois \
-        tldextract nltk pyyaml cryptography httpx 2>/dev/null || \
+        pyyaml cryptography httpx 2>/dev/null || \
     $PYTHON -m pip install -q \
         requests beautifulsoup4 rich dnspython python-whois \
-        tldextract nltk pyyaml cryptography httpx
+        pyyaml cryptography httpx
 fi
 echo "[+] Python packages installed"
-
-# ── NLTK data ─────────────────────────────────────────────────────────────────
-echo "[*] Downloading NLTK data..."
-$PYTHON -c "import nltk; nltk.download('words', quiet=True); nltk.download('names', quiet=True)" || true
 
 # ── Create directories ────────────────────────────────────────────────────────
 mkdir -p ~/.wordsmith/{sessions,audit}

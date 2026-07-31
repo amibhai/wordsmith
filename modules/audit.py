@@ -1,10 +1,21 @@
-"""HMAC-chained audit log — every action is cryptographically linked."""
+"""HMAC-chained audit log — every action is cryptographically linked.
+
+Trust model: the chain is signed with a random key generated on first use
+and persisted locally (see `_key_path()`). This makes the log tamper-evident
+against post-hoc edits to the log file on disk — it is NOT a substitute for
+OS-level access control, and verifying a log on a different machine requires
+securely transferring that key file too (the same caveat that applies to any
+locally-anchored audit trail).
+"""
 from __future__ import annotations
 
 import hashlib
 import hmac as _hmac
 import json
 import logging
+import os
+import secrets
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +23,61 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 AUDIT_DIR = Path.home() / ".wordsmith" / "audit"
-_SECRET = b"wordsmith-audit-chain-v1"
+
+_KEY_LEN = 32
+# Keyed by resolved path (not a single global) so that pointing AUDIT_DIR at
+# a different directory — e.g. a tmp_path in tests — can never accidentally
+# return a stale key cached from a previous AUDIT_DIR.
+_key_cache: dict[str, bytes] = {}
+
+
+def _key_path() -> Path:
+    return AUDIT_DIR / ".hmac_key"
+
+
+def _load_or_create_key() -> bytes:
+    """Return the local HMAC signing key, generating one on first use.
+
+    The key is created with restrictive permissions and never leaves the
+    machine. A race between two processes creating it simultaneously is
+    resolved by O_EXCL: the loser simply reads back what the winner wrote.
+    """
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _key_path()
+    cache_key = str(path)
+
+    cached = _key_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if path.exists():
+        key = path.read_bytes()
+        _key_cache[cache_key] = key
+        return key
+
+    new_key = secrets.token_bytes(_KEY_LEN)
+    try:
+        # O_BINARY (Windows-only) prevents the C runtime from translating
+        # 0x0A bytes in the random key into 0x0D 0x0A on write — without it
+        # os.open() defaults to text mode on Windows and silently corrupts
+        # any key containing a newline byte.
+        binary_flag = getattr(os, "O_BINARY", 0)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | binary_flag, 0o600)
+        try:
+            os.write(fd, new_key)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass  # best-effort on platforms without POSIX permission bits
+        key = new_key
+    except FileExistsError:
+        # Lost the creation race — another process wrote it first.
+        key = path.read_bytes()
+
+    _key_cache[cache_key] = key
+    return key
 
 
 class AuditLogger:
@@ -118,7 +183,7 @@ class AuditLogger:
     @staticmethod
     def _sign_dict(entry: dict[str, Any]) -> str:
         payload = json.dumps(entry, sort_keys=True, default=str).encode()
-        return _hmac.new(_SECRET, payload, hashlib.sha256).hexdigest()
+        return _hmac.new(_load_or_create_key(), payload, hashlib.sha256).hexdigest()
 
 
 # ── Module-level convenience ──────────────────────────────────────────────────

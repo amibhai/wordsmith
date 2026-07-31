@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
 from typing import Any, Optional
 
@@ -64,7 +64,9 @@ class OSINTCollector:
 
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(fn): name for name, fn in methods.items()}
-            for future in as_completed(futures, timeout=120):
+            pending = set(futures)
+
+            def _collect(future) -> None:
                 name = futures[future]
                 try:
                     result = future.result()
@@ -76,6 +78,24 @@ class OSINTCollector:
                     logger.warning("OSINT %s failed: %s", name, exc)
                     self._results[name] = {}
                     source_status[name] = ("✗", str(exc)[:60])
+
+            try:
+                for future in as_completed(pending, timeout=120):
+                    pending.discard(future)
+                    _collect(future)
+            except FuturesTimeoutError:
+                # One or more sources are still running past the deadline.
+                # Salvage anything that finished in the meantime and mark the
+                # rest as timed out instead of losing the whole batch.
+                for future in pending:
+                    name = futures[future]
+                    if future.done():
+                        _collect(future)
+                    else:
+                        future.cancel()
+                        logger.warning("OSINT %s timed out after 120s", name)
+                        self._results[name] = {}
+                        source_status[name] = ("✗", "timed out after 120s")
 
         # Website scrape is done separately (may be slow)
         try:
