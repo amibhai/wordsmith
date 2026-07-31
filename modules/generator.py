@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import re
-import string
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,37 +15,14 @@ from rich.table import Table
 from rich import box
 
 from .audit import get_logger
+from .scoring import score_word
 from .state import WordsmithSession
+from .streaming import BoundedTopK
 
 logger = logging.getLogger(__name__)
 console = _banner_console
 
 OUTPUTS_DIR = Path(__file__).parent.parent / "outputs"
-
-# Scoring weights
-_SCORE = {
-    "target_name":    10,
-    "employee_name":   8,
-    "domain_name":     7,
-    "product_name":    6,
-    "year_suffix":     5,
-    "symbol_end":      5,
-    "india_pattern":   4,
-    "location_name":   4,
-    "length_sweet":    3,
-    "mixed_charset":   3,
-    "admin_keyword":   2,
-    "keyboard_walk":   1,
-    "too_long":       -2,
-    "all_lower":      -5,
-}
-
-_KEYBOARD_WALK_SEQS = [
-    "qwerty", "asdfgh", "zxcvbn", "qweasd", "asdzxc",
-    "1234", "12345", "123456", "654321",
-]
-
-_ADMIN_KEYWORDS = {"admin", "pass", "password", "root", "user", "login", "default"}
 
 
 class WordlistGenerator:
@@ -82,10 +57,15 @@ class WordlistGenerator:
             console=console,
             transient=True,
         ) as prog:
-            task = prog.add_task("Deduplicating...", total=5)
+            task = prog.add_task("Merging sources...", total=5)
 
-            # 1. Collect all words
-            all_words: dict[str, int] = {}
+            # 1. Bounded merge of all sources — mutated_words is already
+            # capped from the mutation stage; scraped/base/keyword sources
+            # are merged in through the same bounded accumulator so a
+            # surprisingly large supplementary source can never blow past
+            # the word budget either. Scoring happens inline (streaming),
+            # never materializing an unbounded intermediate collection.
+            topk = BoundedTopK(capacity=max(1, max_words))
             for src_words in [
                 self.session.mutated_words,
                 self.session.scraped_words,
@@ -93,20 +73,21 @@ class WordlistGenerator:
                 self.session.target_keywords,
             ]:
                 for w in src_words:
-                    if w not in all_words:
-                        all_words[w] = 0
-            prog.advance(task); prog.update(task, description="Loaded sources")
+                    w = w.strip()
+                    if not w:
+                        continue
+                    sc = score_word(w, self.session) if sort_by_likelihood else 0
+                    topk.offer(w, sc)
+            prog.advance(task); prog.update(task, description="Merged + scored sources")
 
-            # 2. Score
-            if sort_by_likelihood:
-                prog.update(task, description="Scoring words...")
-                for w in all_words:
-                    all_words[w] = self._score_word(w)
+            # 2. (scoring already applied inline above)
             prog.advance(task); prog.update(task, description="Scored")
 
             # 3. Sort by score descending
             prog.update(task, description="Sorting by likelihood...")
-            sorted_words = sorted(all_words.keys(), key=lambda w: all_words[w], reverse=True)
+            ranked = topk.results_with_scores()
+            sorted_words = [w for w, _ in ranked]
+            all_words: dict[str, int] = dict(ranked)
             prog.advance(task)
 
             # 4. Apply size constraints
@@ -136,83 +117,6 @@ class WordlistGenerator:
 
         self._display_summary(sorted_words, all_words, paths, main_sha)
         return str(main_path)
-
-    # ── Likelihood scoring ────────────────────────────────────────────────────
-
-    def _score_word(self, word: str) -> int:
-        score = 0
-        wlow  = word.lower()
-        s     = self.session
-
-        target_low  = (s.target_name or s.target_domain.split(".")[0] or "").lower()
-        domain_low  = s.target_domain.split(".")[0].lower() if s.target_domain else ""
-        employees   = {e.lower() for e in s.target_employees}
-        products    = {p.lower() for p in s.target_products}
-        location    = s.target_location.lower() if s.target_location else ""
-
-        # Target/domain name
-        if target_low and target_low in wlow:
-            score += _SCORE["target_name"]
-        if domain_low and domain_low in wlow:
-            score += _SCORE["domain_name"]
-
-        # Employee name
-        for emp in employees:
-            if emp in wlow:
-                score += _SCORE["employee_name"]
-                break
-
-        # Product name
-        for prod in products:
-            if prod in wlow:
-                score += _SCORE["product_name"]
-                break
-
-        # Location
-        if location and location in wlow:
-            score += _SCORE["location_name"]
-
-        # Ends with year (1990-2029)
-        if re.search(r"(19[89]\d|20[012]\d)$", word):
-            score += _SCORE["year_suffix"]
-
-        # Ends with ! or @
-        if word.endswith("!") or word.endswith("@"):
-            score += _SCORE["symbol_end"]
-
-        # Indian pattern: Word@Year or Word@123
-        if re.search(r"[A-Z][a-z]+@(\d{4}|123|1234)$", word):
-            score += _SCORE["india_pattern"]
-
-        # Length sweet spot 8-16
-        if 8 <= len(word) <= 16:
-            score += _SCORE["length_sweet"]
-
-        # Mixed charset (upper + lower + digit + special)
-        has_upper   = any(c.isupper() for c in word)
-        has_lower   = any(c.islower() for c in word)
-        has_digit   = any(c.isdigit() for c in word)
-        has_special = any(c in string.punctuation for c in word)
-        if sum([has_upper, has_lower, has_digit, has_special]) >= 3:
-            score += _SCORE["mixed_charset"]
-
-        # Contains admin keyword
-        if any(k in wlow for k in _ADMIN_KEYWORDS):
-            score += _SCORE["admin_keyword"]
-
-        # Keyboard walk
-        if any(kw in wlow for kw in _KEYBOARD_WALK_SEQS):
-            score += _SCORE["keyboard_walk"]
-
-        # Too long
-        if len(word) > 20:
-            score += _SCORE["too_long"]
-
-        # All lowercase (most policies require more)
-        if word.islower() and not has_digit:
-            score += _SCORE["all_lower"]
-
-        return score
 
     # ── Size control ──────────────────────────────────────────────────────────
 
@@ -245,6 +149,16 @@ class WordlistGenerator:
 
     # ── File writing ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _stream_write(path: Path, lines: list[str]) -> None:
+        """Write lines one at a time instead of materializing a single
+        giant `"\\n".join(...)` string — keeps peak memory flat regardless
+        of how large --max-words is raised."""
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            for line in lines:
+                fh.write(line)
+                fh.write("\n")
+
     def _write_outputs(
         self, words: list[str], scores: dict[str, int], target: str, ts: str
     ) -> dict[str, Path]:
@@ -252,18 +166,18 @@ class WordlistGenerator:
 
         # Full list
         full_path = OUTPUTS_DIR / f"wordsmith_{target}_{ts}_full.txt"
-        full_path.write_text("\n".join(words), encoding="utf-8")
+        self._stream_write(full_path, words)
         paths["full"] = full_path
 
         # Top 1000
         top_path = OUTPUTS_DIR / f"wordsmith_{target}_{ts}_top1000.txt"
-        top_path.write_text("\n".join(words[:1000]), encoding="utf-8")
+        self._stream_write(top_path, words[:1000])
         paths["top1000"] = top_path
 
         # Name variants only
         name_words = [w for w in words if self._is_name_based(w)]
         name_path = OUTPUTS_DIR / f"wordsmith_{target}_{ts}_names.txt"
-        name_path.write_text("\n".join(name_words), encoding="utf-8")
+        self._stream_write(name_path, name_words)
         paths["names"] = name_path
 
         return paths

@@ -8,17 +8,22 @@ import re
 import string
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from rich.console import Console
 from .banner import console as _banner_console
 from rich.table import Table
 from rich import box
 
+from .scoring import score_word
 from .state import WordsmithSession
+from .streaming import BoundedTopK
 
 logger = logging.getLogger(__name__)
 console = _banner_console
+
+DEFAULT_MAX_WORDS = 5_000_000
+DEFAULT_MAX_SCAN  = 20_000_000
 
 _DATA_DIR = Path(__file__).parent.parent / "data"
 
@@ -87,10 +92,21 @@ class MutationEngine:
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
-    def mutate_all(self, words: list[str]) -> list[str]:
+    def mutate_all(
+        self,
+        words: list[str],
+        max_words: int = DEFAULT_MAX_WORDS,
+        max_scan: Optional[int] = DEFAULT_MAX_SCAN,
+    ) -> list[str]:
         """
-        Apply all enabled strategies to words.
-        Returns deduplicated list. Updates session.strategies_used.
+        Apply all enabled strategies to words, streaming each candidate
+        through a bounded top-K accumulator (see modules/streaming.py) so
+        memory stays bounded regardless of seed-list size: at most
+        `max_words` candidates are ever retained, and at most `max_scan`
+        unique candidates are ever considered (a hard safety valve for
+        pathologically large seed lists — see BoundedTopK docstring).
+        Returns the kept candidates sorted by likelihood score descending.
+        Updates session.strategies_used.
         """
         # Clean input
         cleaned = [w.strip() for w in words if w.strip() and len(w.strip()) >= 2]
@@ -98,7 +114,13 @@ class MutationEngine:
             logger.warning("mutate_all: empty word list")
             return []
 
-        results: set[str] = set(cleaned)
+        topk = BoundedTopK(
+            capacity=max(1, max_words),
+            scan_ceiling=max_scan if max_scan and max_scan > 0 else None,
+        )
+
+        # Seed words themselves are always candidates too.
+        self._offer_batch(topk, cleaned)
 
         strategy_map = {
             1:  ("case_variants",     self._s1_case_variants),
@@ -119,36 +141,73 @@ class MutationEngine:
         for num, (name, fn) in strategy_map.items():
             if num not in self._enabled:
                 continue
+            if topk.limit_hit:
+                break
             try:
-                before = len(results)
+                generated = 0
+                keep_going = True
                 if num == 6:
                     new_words = fn(cleaned)  # type: ignore[call-arg]
+                    generated = len(new_words)
+                    keep_going = self._offer_batch(topk, new_words)
                 elif num == 12:
                     new_words = fn()  # type: ignore[call-arg]
+                    generated = len(new_words)
+                    keep_going = self._offer_batch(topk, new_words)
                 elif num == 9:
                     new_words = fn(self.session.target_domain)
+                    generated = len(new_words)
+                    keep_going = self._offer_batch(topk, new_words)
                 elif num == 13:
                     new_words = fn(self.session.target_location)
+                    generated = len(new_words)
+                    keep_going = self._offer_batch(topk, new_words)
                 elif num == 8:
                     new_words = fn(self.session.target_employees)  # type: ignore[call-arg]
+                    generated = len(new_words)
+                    keep_going = self._offer_batch(topk, new_words)
                 else:
-                    batch: list[str] = []
                     for w in cleaned:
-                        batch.extend(fn(w))  # type: ignore[call-arg]
-                    new_words = batch
-                results.update(new_words)
-                self._stats[name] = len(results) - before
+                        variants = fn(w)  # type: ignore[call-arg]
+                        generated += len(variants)
+                        if not self._offer_batch(topk, variants):
+                            keep_going = False
+                            break
+                self._stats[name] = generated
                 self.session.strategies_used.append(name)
+                if not keep_going:
+                    break
             except Exception as exc:
                 logger.warning("Strategy %s failed: %s", name, exc)
 
-        # Add common passwords file
-        common = _load_lines("common_passwords.txt")
-        results.update(common)
+        if not topk.limit_hit:
+            common = _load_lines("common_passwords.txt")
+            self._offer_batch(topk, common)
 
-        final = self._apply_policy(list(results))
-        logger.info("mutate_all: %d words before policy, %d after", len(results), len(final))
+        if topk.limit_hit:
+            logger.warning(
+                "mutate_all: candidate scan ceiling (%s) reached — results may be "
+                "incomplete; raise --max-candidates-scanned to scan further",
+                max_scan,
+            )
+
+        final = topk.results()
+        logger.info(
+            "mutate_all: scanned %d unique candidates, kept %d (cap=%d)",
+            topk.scanned, len(final), max_words,
+        )
         return final
+
+    def _offer_batch(self, topk: BoundedTopK, words: Iterable[str]) -> bool:
+        """Policy-filter, score, and offer each word to the accumulator.
+        Returns False once the scan ceiling has been reached (caller should
+        stop generating further candidates for this strategy)."""
+        for w in words:
+            if not w or not self._passes_policy(w):
+                continue
+            if not topk.offer(w, score_word(w, self.session)):
+                return False
+        return True
 
     # ── Strategy 1: Case variants ─────────────────────────────────────────────
 
@@ -502,10 +561,12 @@ class MutationEngine:
 
     # ── Policy filter ─────────────────────────────────────────────────────────
 
-    def _apply_policy(self, words: list[str]) -> list[str]:
-        """Filter words against the active password policy."""
+    def _passes_policy(self, word: str) -> bool:
+        """True if a single word satisfies the active password policy.
+        Used inline during streaming so non-conforming candidates never
+        occupy a slot in the bounded accumulator in the first place."""
         if not self.policy:
-            return words
+            return True
 
         min_len = self.policy.get("min_length", 0)
         max_len = self.policy.get("max_length", 0)
@@ -514,23 +575,23 @@ class MutationEngine:
         req_special = self.policy.get("require_special", False)
         forbidden   = set(self.policy.get("forbidden_chars", []))
 
-        filtered: list[str] = []
-        for w in words:
-            if min_len and len(w) < min_len:
-                continue
-            if max_len and len(w) > max_len:
-                continue
-            if req_upper and not any(c.isupper() for c in w):
-                continue
-            if req_number and not any(c.isdigit() for c in w):
-                continue
-            if req_special and not any(c in string.punctuation for c in w):
-                continue
-            if forbidden and any(c in forbidden for c in w):
-                continue
-            filtered.append(w)
+        if min_len and len(word) < min_len:
+            return False
+        if max_len and len(word) > max_len:
+            return False
+        if req_upper and not any(c.isupper() for c in word):
+            return False
+        if req_number and not any(c.isdigit() for c in word):
+            return False
+        if req_special and not any(c in string.punctuation for c in word):
+            return False
+        if forbidden and any(c in forbidden for c in word):
+            return False
+        return True
 
-        return filtered
+    def _apply_policy(self, words: list[str]) -> list[str]:
+        """Batch convenience wrapper around _passes_policy()."""
+        return [w for w in words if self._passes_policy(w)]
 
     # ── Stats display ──────────────────────────────────────────────────────────
 

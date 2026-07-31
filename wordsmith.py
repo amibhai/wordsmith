@@ -21,7 +21,9 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -56,12 +58,26 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Max wordlist size in MB (default 100)")
     p.add_argument("--max-words",   metavar="N",       type=int, default=5_000_000,
                    help="Max word count (default 5M)")
+    p.add_argument("--max-candidates-scanned", metavar="N", type=int, default=20_000_000,
+                   help="Safety valve: stop mutating after this many unique "
+                        "candidates have been considered, even if --max-words "
+                        "hasn't been reached (default 20M, 0 = unlimited)")
     p.add_argument("--policy-min",  metavar="N",       type=int, help="Min password length")
     p.add_argument("--policy-max",  metavar="N",       type=int, help="Max password length")
     p.add_argument("--no-scrape",   action="store_true", help="Skip website scraping")
     p.add_argument("--no-osint",    action="store_true", help="Skip OSINT collection")
     p.add_argument("--seeds",       metavar="FILE",    help="Additional seed words file")
     p.add_argument("--output",      metavar="DIR",     help="Output directory")
+    p.add_argument("--export-rules", action="store_true",
+                    help="Also export a hashcat .rule file + seed-words file "
+                         "usable against any external base wordlist")
+    p.add_argument("--rules-only",  action="store_true",
+                    help="Skip mutation/wordlist generation entirely — only "
+                         "collect OSINT and export the hashcat rule + seeds "
+                         "files (fast path for very large targets)")
+    p.add_argument("--rules-tier",  metavar="TIER",    default="standard",
+                    choices=["basic", "standard", "exhaustive"],
+                    help="Hashcat rule coverage: basic|standard|exhaustive (default standard)")
     p.add_argument("--format",      metavar="FORMAT",  default="all",
                    choices=["json", "md", "all"], help="Report format")
     p.add_argument("--auto",        action="store_true", help="Fully automatic mode")
@@ -92,6 +108,36 @@ def _setup(args: argparse.Namespace) -> None:
         from modules import generator
         generator.OUTPUTS_DIR = Path(args.output)
         generator.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ─── Hashcat rule export ──────────────────────────────────────────────────────
+
+def _export_rules(s: WordsmithSession, tier: str, audit) -> dict[str, str]:
+    """Export a hashcat .rule file + companion seed-words file for the
+    current session's OSINT context. Shared by --auto/--rules-only and the
+    interactive menu so both paths stay in sync."""
+    from modules.generator import OUTPUTS_DIR
+    from modules.rules import RuleExporter
+
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = re.sub(r"[^\w.-]", "_", s.target_domain or s.target_name or "wordsmith")
+
+    exporter = RuleExporter(s)
+    paths = exporter.export(OUTPUTS_DIR, target, ts, tier=tier)
+
+    success(f"Hashcat rules: {paths['rules']}  ({tier} tier)")
+    success(f"Seed words:    {paths['seeds']}")
+    info("Pair with an existing base wordlist, e.g.:")
+    info(f"  cat {paths['seeds']} rockyou.txt > combined.txt")
+    info(f"  hashcat -a 0 -r {paths['rules']} combined.txt hash.txt")
+
+    audit.log(
+        "rules.exported",
+        rules_path=str(paths["rules"]),
+        seeds_path=str(paths["seeds"]),
+        tier=tier,
+    )
+    return {k: str(v) for k, v in paths.items()}
 
 
 # ─── Auto mode ────────────────────────────────────────────────────────────────
@@ -169,43 +215,57 @@ def run_auto(args: argparse.Namespace) -> int:
         except Exception as exc:
             warn(f"Policy detection failed: {exc}")
 
-    # Step 5: Mutation
-    print_section("Word Mutation")
-    try:
-        from modules.mutator import MutationEngine
-        engine = MutationEngine(s)
-        if args.strategies:
-            nums = [int(x.strip()) for x in args.strategies.split(",") if x.strip().isdigit()]
-            engine.enable_strategies(nums)
+    # Step 5+6: Mutation + wordlist generation — skipped entirely under
+    # --rules-only, since the hashcat rule export below needs neither.
+    if not args.rules_only:
+        print_section("Word Mutation")
+        try:
+            from modules.mutator import MutationEngine
+            engine = MutationEngine(s)
+            if args.strategies:
+                nums = [int(x.strip()) for x in args.strategies.split(",") if x.strip().isdigit()]
+                engine.enable_strategies(nums)
 
-        seed_words = (
-            s.target_keywords
-            + s.target_employees
-            + s.target_products
-            + s.scraped_words
-            + s.base_words
-            + ([s.target_domain.split(".")[0]] if s.target_domain else [])
-            + ([s.target_name] if s.target_name else [])
-        )
-        seed_words = list(dict.fromkeys(w for w in seed_words if w))
-        info(f"Mutating {len(seed_words)} seed words...")
-        s.mutated_words = engine.mutate_all(seed_words)
-        engine.print_stats()
-        success(f"Generated {len(s.mutated_words):,} mutations")
-    except Exception as exc:
-        error(f"Mutation failed: {exc}")
-        logger.exception("Mutation error")
-        return 1
+            seed_words = (
+                s.target_keywords
+                + s.target_employees
+                + s.target_products
+                + s.scraped_words
+                + s.base_words
+                + ([s.target_domain.split(".")[0]] if s.target_domain else [])
+                + ([s.target_name] if s.target_name else [])
+            )
+            seed_words = list(dict.fromkeys(w for w in seed_words if w))
+            info(f"Mutating {len(seed_words)} seed words...")
+            s.mutated_words = engine.mutate_all(
+                seed_words,
+                max_words=args.max_words,
+                max_scan=args.max_candidates_scanned or None,
+            )
+            engine.print_stats()
+            success(f"Generated {len(s.mutated_words):,} mutations")
+        except Exception as exc:
+            error(f"Mutation failed: {exc}")
+            logger.exception("Mutation error")
+            return 1
 
-    # Step 6: Generate
-    print_section("Wordlist Generation")
-    try:
-        from modules.generator import WordlistGenerator
-        gen = WordlistGenerator(s)
-        gen.build(max_size_mb=args.max_size, max_words=args.max_words)
-    except Exception as exc:
-        error(f"Generation failed: {exc}")
-        return 1
+        print_section("Wordlist Generation")
+        try:
+            from modules.generator import WordlistGenerator
+            gen = WordlistGenerator(s)
+            gen.build(max_size_mb=args.max_size, max_words=args.max_words)
+        except Exception as exc:
+            error(f"Generation failed: {exc}")
+            return 1
+
+    # Step 6b: Hashcat rule export
+    if args.export_rules or args.rules_only:
+        print_section("Hashcat Rule Export")
+        try:
+            _export_rules(s, args.rules_tier, audit)
+        except Exception as exc:
+            error(f"Rule export failed: {exc}")
+            logger.exception("Rule export error")
 
     # Step 7: Report
     print_section("Report Generation")
@@ -221,7 +281,7 @@ def run_auto(args: argparse.Namespace) -> int:
     audit.close(success=True)
     success(f"Session saved: {s.session_id}")
 
-    if not args.quiet:
+    if not args.quiet and s.final_wordlist_path:
         success(f"Wordlist: {s.final_wordlist_path}")
 
     return 0
@@ -303,6 +363,9 @@ def run_interactive(args: argparse.Namespace) -> int:
 
         elif choice == "9":
             _menu_test_hashes(s)
+
+        elif choice == "x":
+            _menu_export_rules(s, args, audit)
 
         elif choice == "s":
             path = mgr.save()
@@ -474,7 +537,11 @@ def _menu_generate(s: WordsmithSession, args: argparse.Namespace, audit) -> None
             return
 
         info(f"Mutating {len(seed_words)} seed words with all enabled strategies...")
-        s.mutated_words = engine.mutate_all(seed_words)
+        s.mutated_words = engine.mutate_all(
+            seed_words,
+            max_words=args.max_words,
+            max_scan=args.max_candidates_scanned or None,
+        )
         engine.print_stats()
         success(f"Generated {len(s.mutated_words):,} candidates")
 
@@ -500,8 +567,9 @@ def _menu_view_top(s: WordsmithSession) -> None:
     words = s.mutated_words[:50] if s.mutated_words else []
     if not words and s.final_wordlist_path:
         try:
+            import itertools
             with open(s.final_wordlist_path, encoding="utf-8") as f:
-                words = [next(f).strip() for _ in range(50) if True]
+                words = [line.strip() for line in itertools.islice(f, 50)]
         except Exception:
             pass
 
@@ -520,6 +588,25 @@ def _menu_export_report(s: WordsmithSession, args: argparse.Namespace) -> None:
             success(f"{fmt_name.upper()} report: {path}")
     except Exception as exc:
         error(f"Report failed: {exc}")
+
+
+def _menu_export_rules(s: WordsmithSession, args: argparse.Namespace, audit) -> None:
+    print_section("Export Hashcat Rules")
+
+    if not s.target_domain and not s.target_name:
+        error("Set a target first (option 1).")
+        return
+
+    tier = args.rules_tier
+    raw = input(f"  Rules tier [basic/standard/exhaustive, default {tier}]: ").strip().lower()
+    if raw in ("basic", "standard", "exhaustive"):
+        tier = raw
+
+    try:
+        _export_rules(s, tier, audit)
+    except Exception as exc:
+        error(f"Rule export failed: {exc}")
+        logger.exception("Rule export error")
 
 
 def _menu_test_hashes(s: WordsmithSession) -> None:
@@ -595,6 +682,7 @@ def _print_help() -> None:
     6 → Generate the wordlist (scores by likelihood)
     7 → Preview top 50 candidates
     8 → Export a pentest report (JSON + Markdown)
+    x → Export hashcat rules (.rule + seed words, for use with any base wordlist)
 
   {C.YELLOW}Session:{C.RESET}
     [s] Save current session to disk
@@ -607,6 +695,8 @@ def _print_help() -> None:
 
   {C.YELLOW}CLI flags:{C.RESET}
     --auto --domain example.com   Fully automated pipeline
+    --export-rules                Also export hashcat .rule + seeds files
+    --rules-only                  Skip wordlist generation, rules/seeds only
     --preflight                   Check dependencies
     --scope-wizard                Create scope.yaml
     --verify-log SESSION_ID       Verify audit chain

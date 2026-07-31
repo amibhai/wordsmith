@@ -374,6 +374,7 @@ MENU_TEMPLATE = f"""
   {C.YELLOW}[7]{C.RESET} View Top Candidates  {C.DIM}(preview top 50 passwords){C.RESET}
   {C.YELLOW}[8]{C.RESET} Export Report        {C.DIM}(JSON / Markdown){C.RESET}
   {C.YELLOW}[9]{C.RESET} Test Against Hashes  {C.DIM}(optional hashcat integration){C.RESET}
+  {C.YELLOW}[x]{C.RESET} Export Hashcat Rules {C.DIM}(.rule + seeds, works with any base wordlist){C.RESET}
   {C.BOLD}{C.DIM}── Session ────────────────────────────────────────────────{C.RESET}
   {C.DIM}[s]{C.RESET} Save Session
   {C.DIM}[r]{C.RESET} Resume Session       {C.DIM}(load previous session){C.RESET}
