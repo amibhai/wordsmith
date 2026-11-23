@@ -44,14 +44,24 @@ _TIER_CEILING: dict[str, int] = {
 
 
 def _escape(ch: str) -> str:
-    """Backslash-escape any non-alphanumeric character so it's always safe
-    to use as a literal argument to a hashcat rule function ($, ^, s),
-    regardless of whether that character also happens to be a rule opcode
-    elsewhere in the grammar. Conservative by design: letters/digits are
-    never ambiguous as arguments and are passed through unescaped."""
-    if ch.isalnum():
-        return ch
-    return f"\\{ch}"
+    """Return a hashcat-safe single-character argument for the $, ^ and s
+    functions.
+
+    CRITICAL: hashcat takes the byte after an opcode LITERALLY and has **no
+    backslash escaping** — `\\` is a John the Ripper convention. The old code
+    emitted `$\\!`, `$\\@`, `sa\\@` etc., which real hashcat rejects as
+    malformed (it reads `$\\` = append backslash, then `!` as a reject
+    opcode) and silently drops the whole line — so essentially every
+    symbol/leet rule was dead on arrival.
+
+    Printable characters therefore pass through unchanged: append '!' is
+    `$!`, append '$' is `$$`, substitute a->@ is `sa@`. Only space / control
+    bytes need hashcat's `\\xNN` hex form, which none of wordsmith's data
+    tables currently contain.
+    """
+    if ch == " " or not ch.isprintable():
+        return f"\\x{ord(ch):02x}"
+    return ch
 
 
 def _append_chain(suffix: str) -> str:
@@ -68,8 +78,9 @@ def _prepend_chain(prefix: str) -> str:
 
 
 def _sub_rule(src: str, dst: str) -> str | None:
-    """'a', '@' -> 'sa\\@' — substitute-all. Only valid for single-character
-    src/dst pairs; hashcat's sXY takes exactly one char each."""
+    """'a', '@' -> 'sa@' — substitute-ALL occurrences. Only valid for
+    single-character src/dst pairs; hashcat's sXY takes exactly one char
+    each (so multi-char leet like n->'|\\|' is correctly skipped)."""
     if len(src) != 1 or len(dst) != 1:
         return None
     return f"s{_escape(src)}{_escape(dst)}"
@@ -102,7 +113,12 @@ class RuleExporter:
 
     @staticmethod
     def _case_rules() -> list[str]:
-        return [":", "l", "u", "c", "C", "t"]
+        # No `t` (toggle/swapcase): the mutator's _s1 never emits swapcase, so
+        # it was an unfaithful token. The remaining five map exactly onto
+        # _s1's lower / upper / capitalize / "first-lower-rest-upper" variants.
+        # _s1's alternating-case ("aLtErNaTiNg") has no position-independent
+        # rule form and is intentionally left as wordlist-only enrichment.
+        return [":", "l", "u", "c", "C"]
 
     def _leet_sub_rules(self) -> list[str]:
         rules: list[str] = []
@@ -145,23 +161,33 @@ class RuleExporter:
 
         lines: list[str] = list(self._case_rules())
 
+        # Appends: raw (for already-lowercase base lists like rockyou), plus
+        # l- and c-prefixed to faithfully match the mutator, which appends to
+        # word.lower() (_s4/_s5) and word.title() (c) respectively.
         suffixes = self._suffix_strings(tier)
-        for case_op in ("", "c"):
+        for case_op in ("", "l", "c"):
             for suf in suffixes:
                 lines.append(f"{case_op}{_append_chain(suf)}")
 
+        # Prepends: raw + l-prefixed (the mutator prepends to word.lower()).
         for pre in self._prefix_strings():
-            lines.append(_prepend_chain(pre))
+            chain = _prepend_chain(pre)
+            lines.append(chain)
+            lines.append(f"l{chain}")
 
         if tier in ("standard", "exhaustive"):
+            # Single-char leet substitutions (substitute-ALL), applied raw and
+            # on the lowercased word. Standard hashcat leet — a complement to,
+            # not a 1:1 mirror of, the wordlist's positional leet.
             leet = self._leet_sub_rules()
             lines.extend(leet)
             for r in leet:
-                lines.append(f"c{r}")
+                lines.append(f"l{r}")
 
             for yr in self._year_strings(tier):
                 chain = _append_chain(yr)
                 lines.append(chain)
+                lines.append(f"l{chain}")
                 lines.append(f"c{chain}")
 
         if tier == "exhaustive":
