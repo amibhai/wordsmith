@@ -81,6 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rules-tier",  metavar="TIER",    default="standard",
                     choices=["basic", "standard", "exhaustive"],
                     help="Hashcat rule coverage: basic|standard|exhaustive (default standard)")
+    p.add_argument("--defend",      action="store_true",
+                    help="Defensive mode: from the same OSINT, emit a custom "
+                         "banned-password list + an exposure report for the "
+                         "client to harden with (blue-team)")
+    p.add_argument("--defend-format", metavar="FMT", default="all",
+                    help="Banned-list formats, comma-separated: "
+                         "entra,ad,keycloak,pwquality,all (default all)")
     p.add_argument("--format",      metavar="FORMAT",  default="all",
                    choices=["json", "md", "all"], help="Report format")
     p.add_argument("--auto",        action="store_true", help="Fully automatic mode")
@@ -141,6 +148,33 @@ def _export_rules(s: WordsmithSession, tier: str, audit) -> dict[str, str]:
         tier=tier,
     )
     return {k: str(v) for k, v in paths.items()}
+
+
+# ─── Defensive mode (blue-team) ───────────────────────────────────────────────
+
+def _defend(s: WordsmithSession, fmt_arg: str, audit) -> dict[str, str]:
+    """Emit a custom banned-password list + exposure report from the session's
+    OSINT context. Shared by --defend (auto) and the interactive menu."""
+    from modules.generator import OUTPUTS_DIR
+    from modules.defense import DefenseAnalyzer, DEFEND_FORMATS
+
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = re.sub(r"[^\w.-]", "_", s.target_domain or s.target_name or "wordsmith")
+
+    formats = [f.strip().lower() for f in (fmt_arg or "all").split(",") if f.strip()]
+    bad = [f for f in formats if f not in DEFEND_FORMATS]
+    if bad:
+        warn(f"Ignoring unknown --defend-format value(s): {', '.join(bad)}")
+    formats = [f for f in formats if f in DEFEND_FORMATS] or ["all"]
+
+    analyzer = DefenseAnalyzer(s, audit=audit)
+    paths = analyzer.export(OUTPUTS_DIR, target, ts, formats=formats)
+
+    success(f"Exposure report: {paths.get('report_md')}")
+    for key in ("entra", "keycloak", "pwquality"):
+        if key in paths:
+            success(f"Banned list ({key}): {paths[key]}")
+    return paths
 
 
 # ─── Auto mode ────────────────────────────────────────────────────────────────
@@ -291,6 +325,15 @@ def run_auto(args: argparse.Namespace) -> int:
             error(f"Rule export failed: {exc}")
             logger.exception("Rule export error")
 
+    # Step 6c: Defensive mode (blue-team) — banned list + exposure report
+    if args.defend:
+        print_section("Defensive Mode")
+        try:
+            _defend(s, args.defend_format, audit)
+        except Exception as exc:
+            error(f"Defensive mode failed: {exc}")
+            logger.exception("Defense error")
+
     # Step 7: Report
     print_section("Report Generation")
     try:
@@ -400,6 +443,9 @@ def run_interactive(args: argparse.Namespace) -> int:
 
         elif choice == "x":
             _menu_export_rules(s, args, audit)
+
+        elif choice == "d":
+            _menu_defend(s, args, audit)
 
         elif choice == "s":
             path = mgr.save()
@@ -647,6 +693,22 @@ def _menu_export_rules(s: WordsmithSession, args: argparse.Namespace, audit) -> 
         logger.exception("Rule export error")
 
 
+def _menu_defend(s: WordsmithSession, args: argparse.Namespace, audit) -> None:
+    print_section("Defensive Mode — banned list + exposure report")
+    if not s.target_domain and not s.target_name:
+        error("Set a target first (option 1).")
+        return
+    fmt = args.defend_format
+    raw = input(f"  Formats [entra,ad,keycloak,pwquality,all; default {fmt}]: ").strip().lower()
+    if raw:
+        fmt = raw
+    try:
+        _defend(s, fmt, audit)
+    except Exception as exc:
+        error(f"Defensive mode failed: {exc}")
+        logger.exception("Defense error")
+
+
 def _menu_test_hashes(s: WordsmithSession) -> None:
     print_section("Test Against Hashes")
     if not s.final_wordlist_path:
@@ -721,6 +783,7 @@ def _print_help() -> None:
     7 → Preview top 50 candidates
     8 → Export a pentest report (JSON + Markdown)
     x → Export hashcat rules (.rule + seed words, for use with any base wordlist)
+    d → Defensive mode: banned-password list + exposure report (blue-team)
 
   {C.YELLOW}Session:{C.RESET}
     [s] Save current session to disk
