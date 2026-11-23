@@ -53,6 +53,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--domain",      metavar="DOMAIN",  help="Target domain (e.g. example.com)")
     p.add_argument("--company",     metavar="NAME",    help="Company/organization name")
     p.add_argument("--scope",       metavar="FILE",    help="Path to scope.yaml", default="scope.yaml")
+    p.add_argument("--no-scope-i-understand", action="store_true",
+                   help="Run --auto even with no valid scope.yaml (DANGEROUS: "
+                        "disables scope/exclude enforcement — authorized use only)")
     p.add_argument("--strategies",  metavar="1,2,3",   help="Enable only these strategy numbers")
     p.add_argument("--max-size",    metavar="MB",      type=float, default=100.0,
                    help="Max wordlist size in MB (default 100)")
@@ -78,6 +81,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rules-tier",  metavar="TIER",    default="standard",
                     choices=["basic", "standard", "exhaustive"],
                     help="Hashcat rule coverage: basic|standard|exhaustive (default standard)")
+    p.add_argument("--defend",      action="store_true",
+                    help="Defensive mode: from the same OSINT, emit a custom "
+                         "banned-password list + an exposure report for the "
+                         "client to harden with (blue-team)")
+    p.add_argument("--defend-format", metavar="FMT", default="all",
+                    help="Banned-list formats, comma-separated: "
+                         "entra,ad,keycloak,pwquality,all (default all)")
     p.add_argument("--format",      metavar="FORMAT",  default="all",
                    choices=["json", "md", "all"], help="Report format")
     p.add_argument("--auto",        action="store_true", help="Fully automatic mode")
@@ -140,6 +150,33 @@ def _export_rules(s: WordsmithSession, tier: str, audit) -> dict[str, str]:
     return {k: str(v) for k, v in paths.items()}
 
 
+# ─── Defensive mode (blue-team) ───────────────────────────────────────────────
+
+def _defend(s: WordsmithSession, fmt_arg: str, audit) -> dict[str, str]:
+    """Emit a custom banned-password list + exposure report from the session's
+    OSINT context. Shared by --defend (auto) and the interactive menu."""
+    from modules.generator import OUTPUTS_DIR
+    from modules.defense import DefenseAnalyzer, DEFEND_FORMATS
+
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = re.sub(r"[^\w.-]", "_", s.target_domain or s.target_name or "wordsmith")
+
+    formats = [f.strip().lower() for f in (fmt_arg or "all").split(",") if f.strip()]
+    bad = [f for f in formats if f not in DEFEND_FORMATS]
+    if bad:
+        warn(f"Ignoring unknown --defend-format value(s): {', '.join(bad)}")
+    formats = [f for f in formats if f in DEFEND_FORMATS] or ["all"]
+
+    analyzer = DefenseAnalyzer(s, audit=audit)
+    paths = analyzer.export(OUTPUTS_DIR, target, ts, formats=formats)
+
+    success(f"Exposure report: {paths.get('report_md')}")
+    for key in ("entra", "keycloak", "pwquality"):
+        if key in paths:
+            success(f"Banned list ({key}): {paths[key]}")
+    return paths
+
+
 # ─── Auto mode ────────────────────────────────────────────────────────────────
 
 def run_auto(args: argparse.Namespace) -> int:
@@ -160,6 +197,22 @@ def run_auto(args: argparse.Namespace) -> int:
     scope_mgr  = ScopeManager(scope_path)
     target     = s.target_domain or s.target_name
     audit      = get_logger(s.session_id)
+
+    # Fail-closed: --auto refuses to run without a valid scope file unless the
+    # operator explicitly accepts the risk. A missing OR malformed scope file
+    # leaves scope_mgr unloaded; the old warn-and-continue path silently
+    # disabled all enforcement on a typo'd --scope.
+    if not scope_mgr.loaded:
+        if args.no_scope_i_understand:
+            warn(f"Running WITHOUT scope enforcement ({scope_mgr.load_error}).")
+            audit.log("scope.disabled", reason=scope_mgr.load_error or "unloaded")
+        else:
+            error(
+                f"No valid scope loaded ({scope_mgr.load_error}). Refusing to run "
+                "--auto. Create one with --scope-wizard, or pass "
+                "--no-scope-i-understand to override (authorized use only)."
+            )
+            return 1
 
     try:
         scope_mgr.require_scope(target, "wordsmith auto mode")
@@ -186,7 +239,7 @@ def run_auto(args: argparse.Namespace) -> int:
             info(f"Loaded {len(extra)} extra seeds from {seed_path}")
 
     # Step 2: OSINT
-    if not args.no_osint and s.target_domain:
+    if not args.no_osint and s.target_domain and scope_mgr.module_allowed("osint"):
         print_section("OSINT Collection")
         try:
             from modules.osint import OSINTCollector
@@ -196,11 +249,12 @@ def run_auto(args: argparse.Namespace) -> int:
             warn(f"OSINT collection failed: {exc}")
 
     # Step 3: Scrape (only if not already done via OSINT)
-    if not args.no_scrape and s.target_domain and not s.scraped_words:
+    if (not args.no_scrape and s.target_domain and not s.scraped_words
+            and scope_mgr.module_allowed("scraper")):
         print_section("Website Scraping")
         try:
             from modules.scraper import WebScraper
-            scraper = WebScraper(s)
+            scraper = WebScraper(s, scope_mgr=scope_mgr)
             scraper.scrape(s.target_domain)
         except Exception as exc:
             warn(f"Scraping failed: {exc}")
@@ -210,8 +264,8 @@ def run_auto(args: argparse.Namespace) -> int:
     if not s.policy and s.target_domain:
         try:
             from modules.analyzer import PolicyAnalyzer
-            analyzer = PolicyAnalyzer(s)
-            analyzer.analyze(s.target_domain)
+            analyzer = PolicyAnalyzer(s, scope_mgr=scope_mgr)
+            analyzer.analyze(s.target_domain, interactive=False)
         except Exception as exc:
             warn(f"Policy detection failed: {exc}")
 
@@ -253,7 +307,11 @@ def run_auto(args: argparse.Namespace) -> int:
         try:
             from modules.generator import WordlistGenerator
             gen = WordlistGenerator(s)
-            gen.build(max_size_mb=args.max_size, max_words=args.max_words)
+            gen.build(
+                max_size_mb=scope_mgr.max_wordlist_mb(args.max_size),
+                max_words=args.max_words,
+                max_scan=args.max_candidates_scanned or None,
+            )
         except Exception as exc:
             error(f"Generation failed: {exc}")
             return 1
@@ -266,6 +324,15 @@ def run_auto(args: argparse.Namespace) -> int:
         except Exception as exc:
             error(f"Rule export failed: {exc}")
             logger.exception("Rule export error")
+
+    # Step 6c: Defensive mode (blue-team) — banned list + exposure report
+    if args.defend:
+        print_section("Defensive Mode")
+        try:
+            _defend(s, args.defend_format, audit)
+        except Exception as exc:
+            error(f"Defensive mode failed: {exc}")
+            logger.exception("Defense error")
 
     # Step 7: Report
     print_section("Report Generation")
@@ -313,6 +380,16 @@ def run_interactive(args: argparse.Namespace) -> int:
     scope_path = Path(args.scope)
     scope_mgr  = ScopeManager(scope_path)
 
+    # CLI overrides also take effect in interactive mode (previously
+    # --strategies and --policy-min/max were silently auto-only).
+    if args.strategies:
+        s.strategies_used = [x.strip() for x in args.strategies.split(",") if x.strip().isdigit()]
+    if args.policy_min or args.policy_max:
+        s.policy.update({
+            "min_length": args.policy_min or 8,
+            "max_length": args.policy_max or 0,
+        })
+
     audit.log("session.start", mode="interactive")
 
     while True:
@@ -347,7 +424,7 @@ def run_interactive(args: argparse.Namespace) -> int:
             _menu_scrape(s, scope_mgr, audit)
 
         elif choice == "4":
-            _menu_detect_policy(s, audit)
+            _menu_detect_policy(s, scope_mgr, audit)
 
         elif choice == "5":
             _menu_configure_mutations(s)
@@ -366,6 +443,9 @@ def run_interactive(args: argparse.Namespace) -> int:
 
         elif choice == "x":
             _menu_export_rules(s, args, audit)
+
+        elif choice == "d":
+            _menu_defend(s, args, audit)
 
         elif choice == "s":
             path = mgr.save()
@@ -454,7 +534,7 @@ def _menu_scrape(s: WordsmithSession, scope_mgr: ScopeManager, audit) -> None:
     try:
         scope_mgr.require_scope(s.target_domain, "website scraping")
         from modules.scraper import WebScraper
-        scraper = WebScraper(s)
+        scraper = WebScraper(s, scope_mgr=scope_mgr)
         words = scraper.scrape(s.target_domain)
         success(f"Scraped {len(words)} unique words from {s.target_domain}")
         audit.log("scrape.done", domain=s.target_domain, words=len(words))
@@ -464,12 +544,12 @@ def _menu_scrape(s: WordsmithSession, scope_mgr: ScopeManager, audit) -> None:
         error(f"Scrape failed: {exc}")
 
 
-def _menu_detect_policy(s: WordsmithSession, audit) -> None:
+def _menu_detect_policy(s: WordsmithSession, scope_mgr: ScopeManager, audit) -> None:
     print_section("Password Policy Detection")
     domain = s.target_domain or ""
     try:
         from modules.analyzer import PolicyAnalyzer
-        analyzer = PolicyAnalyzer(s)
+        analyzer = PolicyAnalyzer(s, scope_mgr=scope_mgr)
         if domain:
             policy = analyzer.analyze(domain)
         else:
@@ -550,7 +630,11 @@ def _menu_generate(s: WordsmithSession, args: argparse.Namespace, audit) -> None
 
         from modules.generator import WordlistGenerator
         gen = WordlistGenerator(s)
-        gen.build(max_size_mb=max_mb, max_words=args.max_words)
+        gen.build(
+            max_size_mb=max_mb,
+            max_words=args.max_words,
+            max_scan=args.max_candidates_scanned or None,
+        )
         audit.log("generate.done", words=s.final_wordlist_size, path=s.final_wordlist_path)
 
     except Exception as exc:
@@ -607,6 +691,22 @@ def _menu_export_rules(s: WordsmithSession, args: argparse.Namespace, audit) -> 
     except Exception as exc:
         error(f"Rule export failed: {exc}")
         logger.exception("Rule export error")
+
+
+def _menu_defend(s: WordsmithSession, args: argparse.Namespace, audit) -> None:
+    print_section("Defensive Mode — banned list + exposure report")
+    if not s.target_domain and not s.target_name:
+        error("Set a target first (option 1).")
+        return
+    fmt = args.defend_format
+    raw = input(f"  Formats [entra,ad,keycloak,pwquality,all; default {fmt}]: ").strip().lower()
+    if raw:
+        fmt = raw
+    try:
+        _defend(s, fmt, audit)
+    except Exception as exc:
+        error(f"Defensive mode failed: {exc}")
+        logger.exception("Defense error")
 
 
 def _menu_test_hashes(s: WordsmithSession) -> None:
@@ -683,6 +783,7 @@ def _print_help() -> None:
     7 → Preview top 50 candidates
     8 → Export a pentest report (JSON + Markdown)
     x → Export hashcat rules (.rule + seed words, for use with any base wordlist)
+    d → Defensive mode: banned-password list + exposure report (blue-team)
 
   {C.YELLOW}Session:{C.RESET}
     [s] Save current session to disk

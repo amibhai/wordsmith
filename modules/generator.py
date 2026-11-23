@@ -15,6 +15,7 @@ from rich.table import Table
 from rich import box
 
 from .audit import get_logger
+from .policy import passes_policy
 from .scoring import score_word
 from .state import WordsmithSession
 from .streaming import BoundedTopK
@@ -41,6 +42,7 @@ class WordlistGenerator:
         max_size_mb: float = 100.0,
         max_words: int = 5_000_000,
         sort_by_likelihood: bool = True,
+        max_scan: Optional[int] = None,
     ) -> str:
         """
         Build and save the full wordlist. Returns path to main output file.
@@ -63,9 +65,16 @@ class WordlistGenerator:
             # capped from the mutation stage; scraped/base/keyword sources
             # are merged in through the same bounded accumulator so a
             # surprisingly large supplementary source can never blow past
-            # the word budget either. Scoring happens inline (streaming),
-            # never materializing an unbounded intermediate collection.
-            topk = BoundedTopK(capacity=max(1, max_words))
+            # the word budget either. `scan_ceiling` ALSO bounds the dedup
+            # set (previously omitted here, so a huge supplementary source
+            # grew `_seen` without limit despite the memory-safety claim).
+            # Scoring and policy-filtering happen inline (streaming), never
+            # materializing an unbounded intermediate collection.
+            policy = self.session.policy
+            topk = BoundedTopK(
+                capacity=max(1, max_words),
+                scan_ceiling=max_scan if max_scan and max_scan > 0 else None,
+            )
             for src_words in [
                 self.session.mutated_words,
                 self.session.scraped_words,
@@ -74,10 +83,11 @@ class WordlistGenerator:
             ]:
                 for w in src_words:
                     w = w.strip()
-                    if not w:
+                    if not w or not passes_policy(w, policy):
                         continue
                     sc = score_word(w, self.session) if sort_by_likelihood else 0
-                    topk.offer(w, sc)
+                    if not topk.offer(w, sc):
+                        break  # scan ceiling hit — stop feeding
             prog.advance(task); prog.update(task, description="Merged + scored sources")
 
             # 2. (scoring already applied inline above)

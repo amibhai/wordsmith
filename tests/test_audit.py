@@ -71,3 +71,63 @@ def test_verify_missing_log_fails():
     ok, count, msg = AuditLogger.verify("no-such-session-id")
     assert ok is False
     assert count == 0
+
+
+def test_resume_continues_chain_and_still_verifies():
+    """Reopening a session's log (resume / report) must CONTINUE the chain,
+    not reset it to genesis. Regression for the bug that made --verify-log
+    report tampering on any resumed-or-reported session."""
+    first = AuditLogger("resume-session")
+    first.log("event.one")
+    first.close(success=True)
+
+    # Simulate a second process reopening the same session (fresh instance,
+    # bypassing the per-process get_logger memo) — e.g. --resume or --report.
+    second = AuditLogger("resume-session")
+    second.log("report.generated")
+    second.close(success=True)
+
+    ok, count, msg = AuditLogger.verify("resume-session")
+    assert ok is True, msg
+    # init + event.one + end  +  resume + report.generated + end
+    assert count == 6
+
+
+def test_trailing_truncation_detected():
+    """Deleting entries off the END of the log must be caught by the .head
+    anchor (a bare forward-chain cannot detect tail truncation)."""
+    logger = AuditLogger("truncate-session")
+    logger.log("event.one")
+    logger.log("event.two")
+    logger.close(success=True)
+
+    path = logger.path
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 2
+    # Drop the last two entries; leave the .head anchor intact.
+    path.write_text("\n".join(lines[:-2]) + "\n", encoding="utf-8")
+
+    ok, count, msg = AuditLogger.verify("truncate-session")
+    assert ok is False
+    assert "truncation" in msg.lower()
+
+
+def test_missing_key_reports_cannot_verify_not_tampering(tmp_path, monkeypatch):
+    """A missing signing key must be reported distinctly from tampering, and
+    must never cause a fresh key to be minted."""
+    from modules import audit as audit_mod
+
+    monkeypatch.setattr(audit_mod, "AUDIT_DIR", tmp_path / "nokey")
+    AuditLogger("k-session").close(success=True)
+
+    # Simulate verifying where the key is unavailable (another machine):
+    # remove the key file and the in-memory cache.
+    (tmp_path / "nokey" / ".hmac_key").unlink()
+    audit_mod._key_cache.clear()
+
+    ok, count, msg = AuditLogger.verify("k-session")
+    assert ok is False
+    assert "cannot verify" in msg.lower()
+    assert "tamper" not in msg.lower() or "not" in msg.lower()
+    # verify() must not have re-created the key.
+    assert not (tmp_path / "nokey" / ".hmac_key").exists()

@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import string
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
@@ -15,6 +14,7 @@ from .banner import console as _banner_console
 from rich.table import Table
 from rich import box
 
+from .policy import passes_policy
 from .scoring import score_word
 from .state import WordsmithSession
 from .streaming import BoundedTopK
@@ -114,6 +114,10 @@ class MutationEngine:
             logger.warning("mutate_all: empty word list")
             return []
 
+        # Fresh run-record (don't accumulate across repeated generates).
+        self._stats = {}
+        self.session.strategies_applied = []
+
         topk = BoundedTopK(
             capacity=max(1, max_words),
             scan_ceiling=max_scan if max_scan and max_scan > 0 else None,
@@ -143,38 +147,32 @@ class MutationEngine:
                 continue
             if topk.limit_hit:
                 break
+            # Count the UNIQUE, policy-passing candidates this strategy
+            # actually contributes (delta in the accumulator's scan count),
+            # not the raw pre-dedup/pre-policy variant count the stats used to
+            # report — which overstated output several-fold.
+            before = topk.scanned
             try:
-                generated = 0
                 keep_going = True
                 if num == 6:
-                    new_words = fn(cleaned)  # type: ignore[call-arg]
-                    generated = len(new_words)
-                    keep_going = self._offer_batch(topk, new_words)
+                    keep_going = self._offer_batch(topk, fn(cleaned))  # type: ignore[call-arg]
+                elif num == 11:
+                    keep_going = self._offer_batch(topk, fn())  # type: ignore[call-arg]
                 elif num == 12:
-                    new_words = fn()  # type: ignore[call-arg]
-                    generated = len(new_words)
-                    keep_going = self._offer_batch(topk, new_words)
+                    keep_going = self._offer_batch(topk, fn())  # type: ignore[call-arg]
                 elif num == 9:
-                    new_words = fn(self.session.target_domain)
-                    generated = len(new_words)
-                    keep_going = self._offer_batch(topk, new_words)
+                    keep_going = self._offer_batch(topk, fn(self.session.target_domain))
                 elif num == 13:
-                    new_words = fn(self.session.target_location)
-                    generated = len(new_words)
-                    keep_going = self._offer_batch(topk, new_words)
+                    keep_going = self._offer_batch(topk, fn(self.session.target_location))
                 elif num == 8:
-                    new_words = fn(self.session.target_employees)  # type: ignore[call-arg]
-                    generated = len(new_words)
-                    keep_going = self._offer_batch(topk, new_words)
+                    keep_going = self._offer_batch(topk, fn(self.session.target_employees))  # type: ignore[call-arg]
                 else:
                     for w in cleaned:
-                        variants = fn(w)  # type: ignore[call-arg]
-                        generated += len(variants)
-                        if not self._offer_batch(topk, variants):
+                        if not self._offer_batch(topk, fn(w)):  # type: ignore[call-arg]
                             keep_going = False
                             break
-                self._stats[name] = generated
-                self.session.strategies_used.append(name)
+                self._stats[name] = topk.scanned - before
+                self.session.strategies_applied.append(name)
                 if not keep_going:
                     break
             except Exception as exc:
@@ -472,13 +470,12 @@ class MutationEngine:
 
     # ── Strategy 11: CMS defaults ─────────────────────────────────────────────
 
-    def _s11_cms_defaults(self, word: str) -> list[str]:
-        results: list[str] = []
-        # Generic defaults independent of word — seeded once
-        if word.lower() not in ("admin", "administrator", "root", "test"):
-            return []
-
-        cms_defaults = [
+    def _s11_cms_defaults(self) -> list[str]:
+        """CMS / admin default credentials, seeded ONCE per run (plus
+        org-combined forms). Previously this took a word and returned [] unless
+        that word was literally admin/root/test, so for real OSINT seed sets it
+        contributed nothing — the advertised strategy was effectively dead."""
+        results: list[str] = [
             "admin", "administrator", "admin123", "admin@123",
             "Admin@123", "Admin123!", "wp-admin", "cpanel",
             "joomla", "joomlaadmin", "siteadmin",
@@ -486,10 +483,12 @@ class MutationEngine:
             "default", "guest", "webmaster",
             "sysadmin", "netadmin", "dbadmin",
         ]
-        results.extend(cms_defaults)
 
-        # Combine with target name
-        base = self.session.target_name.lower() or self.session.target_domain.split(".")[0].lower()
+        # Combine with the org's own name/domain label.
+        base = (
+            self.session.target_name
+            or (self.session.target_domain.split(".")[0] if self.session.target_domain else "")
+        ).lower()
         if base:
             for d in ["admin", "user", "root", "pass"]:
                 results += [f"{base}{d}", f"{d}{base}", f"{base}.{d}"]
@@ -564,30 +563,9 @@ class MutationEngine:
     def _passes_policy(self, word: str) -> bool:
         """True if a single word satisfies the active password policy.
         Used inline during streaming so non-conforming candidates never
-        occupy a slot in the bounded accumulator in the first place."""
-        if not self.policy:
-            return True
-
-        min_len = self.policy.get("min_length", 0)
-        max_len = self.policy.get("max_length", 0)
-        req_upper   = self.policy.get("require_upper", False)
-        req_number  = self.policy.get("require_number", False)
-        req_special = self.policy.get("require_special", False)
-        forbidden   = set(self.policy.get("forbidden_chars", []))
-
-        if min_len and len(word) < min_len:
-            return False
-        if max_len and len(word) > max_len:
-            return False
-        if req_upper and not any(c.isupper() for c in word):
-            return False
-        if req_number and not any(c.isdigit() for c in word):
-            return False
-        if req_special and not any(c in string.punctuation for c in word):
-            return False
-        if forbidden and any(c in forbidden for c in word):
-            return False
-        return True
+        occupy a slot in the bounded accumulator in the first place. Shares
+        one definition with the generator via modules/policy.py."""
+        return passes_policy(word, self.policy)
 
     def _apply_policy(self, words: list[str]) -> list[str]:
         """Batch convenience wrapper around _passes_policy()."""

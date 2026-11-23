@@ -125,3 +125,66 @@ def test_require_scope_raises_for_out_of_scope_target(tmp_path):
 
     # Should not raise for an in-scope target.
     mgr.require_scope("example.com")
+
+
+def test_expiry_enforced_for_ip_and_email_not_just_domain(tmp_path):
+    """Regression: expiry only gated the domain branch, so an expired
+    engagement still authorized every in-scope IP and email target."""
+    scope_path = _write_scope(tmp_path, """
+        engagement:
+          expiry_date: "2000-01-01"
+        targets:
+          domains:
+            - "example.com"
+          ip_ranges:
+            - "10.0.0.0/8"
+          emails:
+            - "@example.com"
+    """)
+    mgr = ScopeManager(scope_path)
+    assert mgr.check_scope("example.com") is False
+    assert mgr.check_scope("10.0.0.5") is False
+    assert mgr.check_scope("dev@example.com") is False
+
+
+def test_allowed_modules_restriction(tmp_path):
+    scope_path = _write_scope(tmp_path, """
+        targets:
+          domains:
+            - "example.com"
+        restrictions:
+          allowed_modules:
+            - osint
+            - mutator
+    """)
+    mgr = ScopeManager(scope_path)
+    assert mgr.module_allowed("osint") is True
+    assert mgr.module_allowed("scraper") is False
+    # No restriction list => everything allowed.
+    assert ScopeManager(_write_scope(tmp_path, """
+        targets: {domains: ["example.com"]}
+    """)).module_allowed("scraper") is True
+
+
+def test_max_wordlist_mb_clamps_to_restriction(tmp_path):
+    scope_path = _write_scope(tmp_path, """
+        targets:
+          domains:
+            - "example.com"
+        restrictions:
+          max_wordlist_size_mb: 50
+    """)
+    mgr = ScopeManager(scope_path)
+    assert mgr.max_wordlist_mb(100.0) == 50.0   # clamped down
+    assert mgr.max_wordlist_mb(10.0) == 10.0    # already under the cap
+
+
+def test_malformed_scope_is_fail_closed_signal(tmp_path):
+    """A file that exists but won't parse must stay UNLOADED with an error
+    recorded — that is the signal --auto uses to refuse to run (fail-closed),
+    instead of the old silent fail-open."""
+    p = tmp_path / "scope.yaml"
+    p.write_text("targets: [this: is: not: valid: yaml", encoding="utf-8")
+    mgr = ScopeManager(p)
+    assert mgr.loaded is False
+    assert mgr.load_error and "parse" in mgr.load_error.lower()

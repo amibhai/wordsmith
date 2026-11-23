@@ -2,15 +2,16 @@
 # Install: pip install -r requirements.txt
 
 # Core (required)
-requests>=2.31.0,<3.0.0
+httpx>=0.25.0,<1.0.0
 beautifulsoup4>=4.12.0,<5.0.0
 rich>=13.0.0,<14.0.0
 dnspython>=2.4.0,<3.0.0
 python-whois>=0.9.0,<1.0.0
 pyyaml>=6.0,<7.0
-cryptography>=41.0.0
-httpx>=0.25.0,<1.0.0
+# NOTE: the audit chain uses the stdlib hmac/hashlib — no `cryptography`
+# package is imported, and HTTP uses httpx, not `requests`; both were
+# removed as unused (dead dependency + needless CVE surface).
 
 # Optional enrichment (install as needed)
-pypdf>=3.17.0        # document metadata extraction (OSINT collector)
-lxml>=4.9.0          # faster HTML parser for beautifulsoup4
+pypdf>=3.17.0,<6.0.0   # document metadata extraction (OSINT collector)
+lxml>=4.9.0,<6.0.0     # faster HTML parser; used automatically when present

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
@@ -15,11 +16,19 @@ from .banner import console as _banner_console
 from rich.table import Table
 
 from .audit import get_logger
+from .netutil import ScopedHTTPClient, ScopeBlocked
 from .scope import ScopeManager, DEFAULT_SCOPE_FILE
 from .state import WordsmithSession
 
 logger = logging.getLogger(__name__)
 console = _banner_console
+
+# Wall-clock budget for the parallel collection phase.
+OSINT_DEADLINE = 120
+# Hard per-call bound for WHOIS. python-whois shells out to the `whois` binary
+# with no timeout; a hanging lookup otherwise kept the thread pool alive past
+# OSINT_DEADLINE (its context-manager exit waits on running workers).
+WHOIS_TIMEOUT = 20
 
 _COMMON_SUBDOMAINS = [
     "www", "mail", "vpn", "remote", "admin", "portal", "dev", "staging",
@@ -51,12 +60,14 @@ class OSINTCollector:
         self._scope_mgr.require_scope(domain, "OSINT collection")
         self._audit.log("osint.start", domain=domain)
 
+        # Email harvest is intentionally NOT in this pool: it reads whois /
+        # social results and so must run AFTER they resolve (previously it
+        # raced them, leaving the registrant-email path effectively dead).
         methods = {
             "whois":        lambda: self.collect_whois(domain),
             "dns":          lambda: self.collect_dns(domain),
             "certificates": lambda: self.collect_certificates(domain),
             "social":       lambda: self.collect_social(domain),
-            "emails":       lambda: self.collect_emails(domain),
             "metadata":     lambda: self.collect_metadata(domain),
         }
 
@@ -80,7 +91,7 @@ class OSINTCollector:
                     source_status[name] = ("✗", str(exc)[:60])
 
             try:
-                for future in as_completed(pending, timeout=120):
+                for future in as_completed(pending, timeout=OSINT_DEADLINE):
                     pending.discard(future)
                     _collect(future)
             except FuturesTimeoutError:
@@ -93,25 +104,44 @@ class OSINTCollector:
                         _collect(future)
                     else:
                         future.cancel()
-                        logger.warning("OSINT %s timed out after 120s", name)
+                        logger.warning("OSINT %s timed out after %ss", name, OSINT_DEADLINE)
                         self._results[name] = {}
-                        source_status[name] = ("✗", "timed out after 120s")
+                        source_status[name] = ("✗", f"timed out after {OSINT_DEADLINE}s")
 
-        # Website scrape is done separately (may be slow)
-        try:
-            from .scraper import WebScraper
-            scraper = WebScraper(self.session)
-            scraped = scraper.scrape(domain)
-            self._results["website"] = {"words": scraped, "count": len(scraped)}
-            source_status["website"] = ("✓", f"{len(scraped)} words scraped")
-        except Exception as exc:
-            logger.warning("Website scrape failed: %s", exc)
-            self._results["website"] = {}
-            source_status["website"] = ("✗", str(exc)[:60])
+        # Website scrape is done separately (may be slow). Honor scope's
+        # allowed_modules, and hand the scraper the SAME scope manager so its
+        # fetches are scope-checked too.
+        if self._scope_mgr.module_allowed("scraper"):
+            try:
+                from .scraper import WebScraper
+                scraper = WebScraper(self.session, scope_mgr=self._scope_mgr)
+                scraped = scraper.scrape(domain)
+                self._results["website"] = {"words": scraped, "count": len(scraped)}
+                source_status["website"] = ("✓", f"{len(scraped)} words scraped")
+            except Exception as exc:
+                logger.warning("Website scrape failed: %s", exc)
+                self._results["website"] = {}
+                source_status["website"] = ("✗", str(exc)[:60])
+        else:
+            source_status["website"] = ("–", "skipped (scope restriction)")
 
         self._merge_to_session()
+        # Publish collected sources BEFORE the email pass, with update() rather
+        # than a wholesale reassignment, so _parse_email_pattern's
+        # osint_data["email_format"] is preserved instead of clobbered.
+        self.session.osint_data.update(self._results)
+
+        try:
+            emails = self.collect_emails(domain)
+            self._results["emails"] = emails
+            source_status["emails"] = ("✓", self._summarize("emails", emails))
+        except Exception as exc:
+            logger.warning("OSINT emails failed: %s", exc)
+            self._results["emails"] = []
+            source_status["emails"] = ("✗", str(exc)[:60])
+        self.session.osint_data.update(self._results)
+
         self._display_results(source_status)
-        self.session.osint_data = self._results
         self._audit.log("osint.complete", domain=domain, sources=list(self._results.keys()))
         return self._results
 
@@ -124,8 +154,27 @@ class OSINTCollector:
         except ImportError:
             return {"error": "python-whois not installed"}
 
+        # Run the (un-timed) whois call in a daemon thread and bound it with a
+        # join timeout, so a hung lookup can't exceed WHOIS_TIMEOUT. The daemon
+        # won't block interpreter exit if it's still stuck.
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["w"] = whois_lib.whois(domain)
+            except Exception as exc:  # noqa: BLE001 — surfaced below
+                box["err"] = exc
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(WHOIS_TIMEOUT)
+        if th.is_alive():
+            return {"error": f"whois timed out after {WHOIS_TIMEOUT}s"}
+        if "err" in box:
+            return {"error": str(box["err"])}
+
         try:
-            w = whois_lib.whois(domain)
+            w = box.get("w")
             result: dict[str, Any] = {}
 
             def _first(v):
@@ -221,12 +270,19 @@ class OSINTCollector:
         except Exception:
             pass
 
-        # Subdomain enumeration
+        # Subdomain enumeration — scope + exclude enforced per name. An
+        # explicitly EXCLUDED subdomain (e.g. mail.<domain> carved out by the
+        # client) must never be resolved, even though it falls under an
+        # authorized apex. "exclude always wins" has to hold here too.
         found_subs: list[str] = []
         for sub in _COMMON_SUBDOMAINS:
+            fqdn = f"{sub}.{domain}"
+            if not self._scope_mgr.check_scope(fqdn):
+                logger.debug("Skipping out-of-scope/excluded subdomain %s", fqdn)
+                continue
             try:
-                dns.resolver.resolve(f"{sub}.{domain}", "A", lifetime=2)
-                found_subs.append(f"{sub}.{domain}")
+                dns.resolver.resolve(fqdn, "A", lifetime=2)
+                found_subs.append(fqdn)
                 self.session.target_keywords.append(sub)
             except Exception:
                 pass
@@ -245,16 +301,24 @@ class OSINTCollector:
 
     # ── Method 4: Certificates (crt.sh) ──────────────────────────────────────
 
+    @staticmethod
+    def _is_subdomain(name: str, domain: str) -> bool:
+        """True iff `name` is `domain` itself or a dot-anchored subdomain of it.
+
+        Replaces the old `if domain in name` substring test, under which
+        `example.company.com` and `notexample.com` both matched `example.com`.
+        """
+        name = name.lower().strip().lstrip("*.")
+        domain = domain.lower().strip()
+        return bool(name) and (name == domain or name.endswith("." + domain))
+
     def collect_certificates(self, domain: str) -> dict:
         """Query crt.sh for certificate transparency logs."""
         try:
-            import httpx
-        except ImportError:
-            return {"error": "httpx not installed"}
-
-        try:
             url = f"https://crt.sh/?q=%.{domain}&output=json"
-            with httpx.Client(timeout=15.0) as client:
+            with ScopedHTTPClient(
+                mode="external", allow_hosts=["crt.sh"], timeout=15.0, audit=self._audit
+            ) as client:
                 resp = client.get(url)
             if resp.status_code != 200:
                 return {"error": f"crt.sh returned {resp.status_code}"}
@@ -268,8 +332,8 @@ class OSINTCollector:
                 for field in ("common_name", "name_value"):
                     val = cert.get(field, "")
                     for name in val.split("\n"):
-                        name = name.strip().lstrip("*.")
-                        if domain in name and name not in subdomains:
+                        name = name.strip().lower().lstrip("*.")
+                        if self._is_subdomain(name, domain) and name not in subdomains:
                             subdomains.add(name)
 
                 issuer = cert.get("issuer_ca_id", "")
@@ -298,11 +362,6 @@ class OSINTCollector:
 
     def collect_social(self, domain: str) -> dict:
         """Passive social signal collection — GitHub, HN, Reddit (no auth required)."""
-        try:
-            import httpx
-        except ImportError:
-            return {"error": "httpx not installed"}
-
         result: dict[str, Any] = {
             "github_repos": [],
             "contributors": [],
@@ -317,9 +376,16 @@ class OSINTCollector:
             f'site:linkedin.com/in "{org_name}" — run manually in browser'
         )
 
-        with httpx.Client(
+        with ScopedHTTPClient(
+            mode="external",
+            allow_hosts=[
+                "api.github.com", "github.com",
+                "hn.algolia.com", "algolia.com",
+                "reddit.com", "www.reddit.com",
+            ],
             headers={"User-Agent": "security-audit/1.0"},
             timeout=10.0,
+            audit=self._audit,
         ) as client:
             # GitHub repos
             try:
@@ -327,6 +393,8 @@ class OSINTCollector:
                     "https://api.github.com/search/repositories",
                     params={"q": domain, "per_page": 10},
                 )
+                if resp.status_code == 403:
+                    logger.debug("GitHub search rate-limited (unauthenticated 403)")
                 if resp.status_code == 200:
                     for repo in resp.json().get("items", []):
                         result["github_repos"].append(repo.get("full_name", ""))
@@ -424,56 +492,62 @@ class OSINTCollector:
     # ── Method 7: Document metadata ───────────────────────────────────────────
 
     def collect_metadata(self, domain: str) -> dict:
-        """Download up to 5 public documents and extract author metadata."""
-        try:
-            import httpx
-        except ImportError:
-            return {"error": "httpx not installed"}
+        """Download up to 5 public documents and extract author metadata.
+
+        Every fetch goes through the scope-aware client (TLS on, redirects
+        re-checked per hop) and is size-capped by streaming — so an absolute
+        off-scope document URL is refused and a huge response can't exhaust
+        memory (the old code buffered the full body *before* its 5 MB check).
+        """
+        from urllib.parse import urljoin
 
         result: dict[str, Any] = {"documents": [], "authors": [], "software": []}
+        DOC_CAP = 5 * 1024 * 1024
 
         try:
-            # Find PDF/DOCX links on the homepage
-            with httpx.Client(
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10.0,
-                follow_redirects=True,
-                verify=False,
+            with ScopedHTTPClient(
+                scope_mgr=self._scope_mgr, mode="target",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0, audit=self._audit,
             ) as client:
-                resp = client.get(f"https://{domain}")
-                if resp.status_code != 200:
+                try:
+                    home = client.get_capped(f"https://{domain}", max_bytes=2 * 1024 * 1024)
+                except ScopeBlocked as exc:
+                    logger.debug("metadata homepage blocked: %s", exc)
+                    return result
+                if home.status_code != 200:
                     return result
 
-                import re
+                html = home.content.decode("utf-8", "ignore")
                 doc_urls = re.findall(
                     r'href=["\']([^"\']*\.(?:pdf|docx|xlsx|pptx))["\']',
-                    resp.text,
+                    html,
                     re.IGNORECASE,
                 )
 
                 for doc_url in doc_urls[:5]:
-                    from urllib.parse import urljoin
                     full_url = urljoin(f"https://{domain}", doc_url)
                     try:
-                        doc_resp = client.get(full_url)
-                        if doc_resp.status_code != 200:
-                            continue
-                        if len(doc_resp.content) > 5 * 1024 * 1024:
-                            continue  # Skip >5MB
-                        meta = self._extract_doc_metadata(doc_resp.content, full_url)
-                        if meta:
-                            result["documents"].append({"url": full_url, "metadata": meta})
-                            for field in ("author", "creator", "last_modified_by", "company"):
-                                val = meta.get(field, "")
-                                if val:
-                                    result["authors"].append(val)
-                                    self.session.target_employees.append(val)
-                            for field in ("software", "producer"):
-                                val = meta.get(field, "")
-                                if val:
-                                    result["software"].append(val)
+                        doc = client.get_capped(full_url, max_bytes=DOC_CAP)
+                    except ScopeBlocked as exc:
+                        logger.debug("off-scope document URL refused %s: %s", full_url, exc)
+                        continue
                     except Exception as exc:
                         logger.debug("Doc fetch failed %s: %s", full_url, exc)
+                        continue
+                    if doc.status_code != 200 or doc.truncated:
+                        continue  # non-200, or larger than the cap
+                    meta = self._extract_doc_metadata(doc.content, full_url)
+                    if meta:
+                        result["documents"].append({"url": full_url, "metadata": meta})
+                        for field in ("author", "creator", "last_modified_by", "company"):
+                            val = meta.get(field, "")
+                            if val:
+                                result["authors"].append(val)
+                                self.session.target_employees.append(val)
+                        for field in ("software", "producer"):
+                            val = meta.get(field, "")
+                            if val:
+                                result["software"].append(val)
 
         except Exception as exc:
             result["error"] = str(exc)

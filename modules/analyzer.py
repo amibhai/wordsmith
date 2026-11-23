@@ -10,6 +10,7 @@ from .banner import console as _banner_console
 from rich.table import Table
 from rich import box
 
+from .netutil import ScopedHTTPClient, ScopeBlocked, HTML_PARSER
 from .state import WordsmithSession
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ _POLICY_PATTERNS: list[tuple[str, str, str]] = [
     (r"(?:must|should|require[sd]?)\s+(?:contain|include|have)\s+(?:a\s+)?(?:special|symbol|punctuation)", "require_special", "bool"),
     (r"password\s+(?:must\s+be\s+)?(?:at\s+least\s+)?(\d+)\s+(?:characters?|chars?)\s+long", "min_length", "int"),
     (r"(?:length|characters?)\s*(?:between|from)\s+(\d+)\s*(?:to|-)\s+\d+", "min_length", "int"),
-    (r"(?:length|characters?)\s*between\s+\d+\s*(?:to|-)\s+(\d+)", "max_length", "int"),
+    (r"(?:length|characters?)\s*(?:between|from)\s+\d+\s*(?:to|-)\s+(\d+)", "max_length", "int"),
 ]
 
 DEFAULT_POLICY: dict = {
@@ -44,8 +45,9 @@ class PolicyAnalyzer:
     The output policy dict drives the MutationEngine's filter step.
     """
 
-    def __init__(self, session: WordsmithSession) -> None:
+    def __init__(self, session: WordsmithSession, scope_mgr=None) -> None:
         self.session = session
+        self._scope_mgr = scope_mgr
         self._policy: dict = dict(DEFAULT_POLICY)
 
     # ── Auto-detection ────────────────────────────────────────────────────────
@@ -56,10 +58,9 @@ class PolicyAnalyzer:
         Returns partial policy dict with whatever was found.
         """
         try:
-            import httpx
             from bs4 import BeautifulSoup
         except ImportError:
-            logger.warning("httpx/beautifulsoup4 not installed — skipping auto-detect")
+            logger.warning("beautifulsoup4 not installed — skipping auto-detect")
             return {}
 
         partial: dict = {}
@@ -73,23 +74,31 @@ class PolicyAnalyzer:
             f"https://{domain}/user/register",
         ]
 
-        with httpx.Client(
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=8.0,
-            follow_redirects=True,
-            verify=False,
-        ) as client:
+        try:
+            # Scope-aware (TLS on, redirects re-checked): a login page that
+            # 302s off-scope must not be fetched and parsed.
+            client = ScopedHTTPClient(
+                scope_mgr=self._scope_mgr, mode="target",
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=8.0,
+            )
+        except ImportError:
+            logger.warning("httpx not installed — skipping auto-detect")
+            return {}
+
+        with client:
             for url in policy_pages:
                 try:
                     resp = client.get(url)
                     if resp.status_code not in (200, 201):
                         continue
-                    soup = BeautifulSoup(resp.text, "html.parser")
+                    soup = BeautifulSoup(resp.text, HTML_PARSER)
                     text = soup.get_text(separator=" ").lower()
                     found = self._parse_policy_text(text)
                     partial.update(found)
                     if len(partial) >= 4:
                         break
+                except ScopeBlocked as exc:
+                    logger.debug("Policy page off-scope, skipped %s: %s", url, exc)
                 except Exception as exc:
                     logger.debug("Policy detect failed on %s: %s", url, exc)
 
@@ -146,10 +155,14 @@ class PolicyAnalyzer:
 
     # ── Combined run ──────────────────────────────────────────────────────────
 
-    def analyze(self, domain: str) -> dict:
+    def analyze(self, domain: str, interactive: bool = True) -> dict:
         """
         Try auto-detect, then fill gaps with session scraped text,
         then fallback to defaults. Updates session.policy.
+
+        When `interactive` is False (automated/--auto mode) this NEVER prompts
+        — it falls back to DEFAULT_POLICY silently rather than blocking on
+        input() in a headless pipeline.
         """
         console.print()
         console.print(f"  [color(214)][*][/] Auto-detecting password policy for [bold]{domain}[/]...")
@@ -165,11 +178,14 @@ class PolicyAnalyzer:
                 policy[k] = v
 
         if not auto and not scraped:
-            console.print("  [yellow][!][/] Could not auto-detect policy.")
-            ans = input("  Manually enter policy? [Y/n]: ").strip().lower()
-            if ans in ("", "y", "yes"):
-                manual = self.manual_input()
-                policy.update(manual)
+            if interactive:
+                console.print("  [yellow][!][/] Could not auto-detect policy.")
+                ans = input("  Manually enter policy? [Y/n]: ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    manual = self.manual_input()
+                    policy.update(manual)
+            else:
+                console.print("  [yellow][!][/] No policy detected — using defaults.")
         else:
             console.print(f"  [green][+][/] Policy detected: {auto}")
 

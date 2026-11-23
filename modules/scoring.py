@@ -6,8 +6,8 @@ the two stages can never silently drift apart.
 from __future__ import annotations
 
 import re
-import string
 
+from .policy import has_special
 from .state import WordsmithSession
 
 # Scoring weights
@@ -48,7 +48,10 @@ def score_word(word: str, session: WordsmithSession) -> int:
     wlow = word.lower()
     s = session
 
-    target_low = (s.target_name or (s.target_domain.split(".")[0] if s.target_domain else "") or "").lower()
+    # target_name only — do NOT fall back to the domain label here, or a
+    # --domain-only run would score the SAME token under both target_name
+    # (+10) and domain_name (+7), double-counting one concept as +17.
+    target_low = s.target_name.lower() if s.target_name else ""
     domain_low = s.target_domain.split(".")[0].lower() if s.target_domain else ""
     employees  = {e.lower() for e in s.target_employees}
     products   = {p.lower() for p in s.target_products}
@@ -87,8 +90,8 @@ def score_word(word: str, session: WordsmithSession) -> int:
     has_upper   = any(c.isupper() for c in word)
     has_lower   = any(c.islower() for c in word)
     has_digit   = any(c.isdigit() for c in word)
-    has_special = any(c in string.punctuation for c in word)
-    if sum([has_upper, has_lower, has_digit, has_special]) >= 3:
+    has_sym     = has_special(word)  # Unicode-aware, not ASCII-only
+    if sum([has_upper, has_lower, has_digit, has_sym]) >= 3:
         score += SCORE_WEIGHTS["mixed_charset"]
 
     if any(k in wlow for k in ADMIN_KEYWORDS):

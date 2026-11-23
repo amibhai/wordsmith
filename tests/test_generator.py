@@ -70,3 +70,27 @@ def test_build_bounds_merged_output_to_max_words():
     gen = WordlistGenerator(s)
     gen.build(max_size_mb=100, max_words=10)
     assert s.final_wordlist_size == 10
+
+
+def test_build_applies_policy_to_raw_merged_sources():
+    """Regression: the policy filtered mutations but NOT the generator's raw
+    scraped/base/keyword merge, so a too-short scraped word slipped through."""
+    s = _session()
+    s.policy = {"min_length": 8}
+    s.scraped_words = ["hi", "longenoughword"]
+    gen = WordlistGenerator(s)
+    path = gen.build(max_size_mb=100, max_words=1000)
+    lines = set(Path(path).read_text(encoding="utf-8").splitlines())
+    assert "hi" not in lines           # below policy min length — filtered
+    assert "longenoughword" in lines
+
+
+def test_build_scan_ceiling_bounds_unique_intake():
+    """Regression: build() left the dedup set unbounded (no scan_ceiling),
+    contradicting the bounded-memory claim. With max_scan set, at most that
+    many unique candidates are ever considered."""
+    s = _session()
+    s.mutated_words = [f"w{i}" for i in range(100)]
+    gen = WordlistGenerator(s)
+    gen.build(max_size_mb=100, max_words=1000, max_scan=5)
+    assert s.final_wordlist_size == 5

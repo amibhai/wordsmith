@@ -14,14 +14,19 @@ echo ""
 
 # ── Detect OS and package manager ─────────────────────────────────────────────
 PKG_INSTALL=""
+PKG_MGR=""
 if command -v apt-get &>/dev/null; then
-    PKG_INSTALL="apt-get install -y"
+    PKG_INSTALL="apt-get install -y";              PKG_MGR="apt"
 elif command -v pacman &>/dev/null; then
-    PKG_INSTALL="pacman -S --noconfirm --needed"
+    PKG_INSTALL="pacman -S --noconfirm --needed";  PKG_MGR="pacman"
 elif command -v dnf &>/dev/null; then
-    PKG_INSTALL="dnf install -y"
+    PKG_INSTALL="dnf install -y";                  PKG_MGR="dnf"
 elif command -v yum &>/dev/null; then
-    PKG_INSTALL="yum install -y"
+    PKG_INSTALL="yum install -y";                  PKG_MGR="yum"
+elif command -v apk &>/dev/null; then
+    PKG_INSTALL="apk add";                         PKG_MGR="apk"
+elif command -v brew &>/dev/null; then
+    PKG_INSTALL="brew install";                    PKG_MGR="brew"
 fi
 
 # ── Check Python version ──────────────────────────────────────────────────────
@@ -42,42 +47,49 @@ echo "[+] Python $PY_VERSION — OK"
 
 # ── Install system packages ───────────────────────────────────────────────────
 SYSTEM_PACKAGES="curl whois"
-if command -v apt-get &>/dev/null; then
-    SYSTEM_PACKAGES="$SYSTEM_PACKAGES dnsutils"
-elif command -v pacman &>/dev/null; then
-    SYSTEM_PACKAGES="$SYSTEM_PACKAGES bind"
-else
-    SYSTEM_PACKAGES="$SYSTEM_PACKAGES bind-utils"
-fi
+case "$PKG_MGR" in
+    apt)          SYSTEM_PACKAGES="$SYSTEM_PACKAGES dnsutils" ;;
+    pacman|brew)  SYSTEM_PACKAGES="$SYSTEM_PACKAGES bind" ;;
+    apk)          SYSTEM_PACKAGES="$SYSTEM_PACKAGES bind-tools" ;;
+    *)            SYSTEM_PACKAGES="$SYSTEM_PACKAGES bind-utils" ;;
+esac
 
 if [ -n "$PKG_INSTALL" ]; then
     echo "[*] Installing system packages: $SYSTEM_PACKAGES"
-    if [ "$EUID" -eq 0 ]; then
+    if [ "$PKG_MGR" = "brew" ]; then
+        # Homebrew must NOT run as root.
+        $PKG_INSTALL $SYSTEM_PACKAGES || echo "[!] Some packages may have failed — continuing"
+    elif [ "${EUID:-$(id -u)}" -eq 0 ]; then
         $PKG_INSTALL $SYSTEM_PACKAGES || echo "[!] Some packages may have failed — continuing"
     else
         echo "[!] Not root — skipping system package install."
         echo "    Run manually: sudo $PKG_INSTALL $SYSTEM_PACKAGES"
     fi
+else
+    echo "[!] No supported package manager found (apt/dnf/yum/pacman/apk/brew)."
+    echo "    Install manually: curl, whois, and dig (dnsutils/bind-tools)."
 fi
 
 # ── Install Python packages ───────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REQ="$SCRIPT_DIR/requirements.txt"
 
+# Prefer a plain install; only retry with --break-system-packages on a
+# PEP 668 "externally-managed-environment" failure. Errors are NOT swallowed
+# (no 2>/dev/null) so real problems surface. A venv is still the cleanest
+# option — see the README.
+PKGS="beautifulsoup4 rich dnspython python-whois pyyaml httpx"
 echo "[*] Installing Python packages..."
 if [ -f "$REQ" ]; then
-    $PYTHON -m pip install --break-system-packages -q -r "$REQ" 2>/dev/null || \
     $PYTHON -m pip install -q -r "$REQ" || \
-    echo "[!] pip install may have had issues — check output above"
+    $PYTHON -m pip install --break-system-packages -q -r "$REQ" || \
+    echo "[!] pip install failed — see errors above (try a virtualenv)"
 else
-    $PYTHON -m pip install --break-system-packages -q \
-        requests beautifulsoup4 rich dnspython python-whois \
-        pyyaml cryptography httpx 2>/dev/null || \
-    $PYTHON -m pip install -q \
-        requests beautifulsoup4 rich dnspython python-whois \
-        pyyaml cryptography httpx
+    $PYTHON -m pip install -q $PKGS || \
+    $PYTHON -m pip install --break-system-packages -q $PKGS || \
+    echo "[!] pip install failed — see errors above (try a virtualenv)"
 fi
-echo "[+] Python packages installed"
+echo "[+] Python package install step complete"
 
 # ── Create directories ────────────────────────────────────────────────────────
 mkdir -p ~/.wordsmith/{sessions,audit}
