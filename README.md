@@ -15,7 +15,9 @@ Made by अमी — same DNA as [wifi_down](https://github.com/amibhai/wifi_do
 
 wordsmith passively collects public intelligence about a target organization (WHOIS, DNS, certificates, GitHub, website), then applies 13 configurable mutation strategies to generate a likelihood-scored, policy-aware wordlist tailored to that specific target — or, via hashcat rule export, turns that same target intelligence into a transformation you can run against a base wordlist you already have (rockyou, SecLists, ...) at native hashcat speed.
 
-**Every action is HMAC-chained and audited. Every outbound request is scope-checked, including explicit exclusions. No active scanning. No auth bypasses. Memory use stays bounded even against very large targets.**
+**Dual-use:** with `--defend` it flips red to blue — the same intelligence becomes a custom **banned-password list** (Microsoft Entra ID / Azure AD, Keycloak, `pam_pwquality`) plus an **exposure report** that shows the client exactly how guessable their org-specific passwords are, and what to harden. *wordsmith shows you how an attacker would build a wordlist for your org — then hands you the ban-list to stop them.*
+
+**Every action is HMAC-chained and audited (tamper-evident against edits and trailing truncation). Every outbound request — including redirects and derived document URLs — is scope-checked, and explicit exclusions always win. No active scanning. No auth bypasses. Memory use stays bounded even against very large targets.**
 
 ---
 
@@ -53,6 +55,9 @@ python3 wordsmith.py --auto --domain example.com --scope scope.yaml --export-rul
 # Rules + seeds only — skip full wordlist generation (fast path for big targets)
 python3 wordsmith.py --auto --domain example.com --scope scope.yaml --rules-only
 
+# Defensive mode: banned-password list + exposure report for the client (blue-team)
+python3 wordsmith.py --auto --domain example.com --scope scope.yaml --defend
+
 # Resume a previous session
 python3 wordsmith.py --resume SESSION_ID
 
@@ -79,10 +84,11 @@ python wordsmith.py --auto --domain example.com --scope scope.yaml
 | 13 Mutation Strategies | Case, leet, years, symbols, numbers, combinator, walks, names, domain, patterns, CMS defaults, temporal, location |
 | Likelihood Scoring | Sorts candidates by probability for that specific target |
 | Bounded Streaming Pipeline | Memory stays flat regardless of seed-list size — a fixed-capacity top-K accumulator, not an unbounded in-RAM set |
-| Hashcat Rule Export | Turns mutation logic into a `.rule` file usable against *any* base wordlist via `hashcat -r` |
-| Policy Filtering | Filters output to comply with detected password policy, inline during generation |
-| HMAC Audit Chain | Every action cryptographically logged with a locally-generated, non-public signing key |
-| Scope Enforcement | Blocks actions on unauthorized targets; explicit `exclude` rules always win |
+| Hashcat Rule Export | Turns mutation logic into a valid `.rule` file usable against *any* base wordlist via `hashcat -r` |
+| **Defensive Mode** | `--defend`: custom banned-password list (Entra ID / Azure AD, Keycloak, pwquality) + an exposure report for the client to harden with |
+| Policy Filtering | Filters output to comply with detected password policy, inline during generation *and* over the final merge |
+| HMAC Audit Chain | Every action cryptographically logged; chain continues across resume/report and detects edits **and trailing truncation** |
+| Scope Enforcement | Blocks unauthorized targets on every request (redirects/derived URLs included); explicit `exclude` rules always win; `--auto` fails closed |
 | Three Output Files | Full list, Top-1000, Name-based variants |
 | Report Generation | JSON + Markdown engagement reports |
 | Session Resume | Save and resume long-running sessions |
@@ -105,6 +111,8 @@ python wordsmith.py --auto --domain example.com --scope scope.yaml
 11. **CMS defaults** — wp-admin, cpanel, joomlaadmin
 12. **Temporal patterns** — FY2024, Q12024, Jan2024
 13. **Location variants** — delhi123, Delhi@123, mumbaiHQ
+
+> **Wordlist vs. rules:** a few transforms exist only in the generated wordlist, not in the exported `.rule` file, because they have no faithful position-independent hashcat equivalent — specifically **alternating-case** (`aLtErNaTiNg`) and **single-position** leet (`p4ssword` with just one letter changed). The rule file emits the faithful subset (case ops, lower/title-cased affixes, and substitute-*all* leet). This is by design, not a gap.
 
 Every candidate streams through a bounded top-K accumulator (`modules/streaming.py`) scored by `modules/scoring.py` — at most `--max-words` candidates are ever kept, and at most `--max-candidates-scanned` unique candidates are ever considered (a documented safety valve for very large targets), so peak memory stays predictable regardless of how many scraped words or employee names feed into the run.
 
@@ -136,6 +144,32 @@ hashcat -a 0 -r wordsmith_example_com.rule combined.txt hash.txt
 
 `--rules-tier` controls coverage: `basic` (case + top suffixes), `standard` (+ leet substitutions + OSINT year suffixes, default), or `exhaustive` (+ full suffix/pattern coverage, still capped to a reviewable line count).
 
+Emitted rules are **valid hashcat syntax** — arguments are literal (`$!`, `$$`, `sa@`), not John-style backslash escapes. A test shells out to `hashcat --stdout` to confirm it when a hashcat binary is available.
+
+---
+
+## Defensive Mode (blue-team)
+
+The same OSINT that builds an attacker's wordlist also tells a defender exactly where they're exposed. `--defend` turns one engagement's intelligence into two client deliverables:
+
+```bash
+# Produce a banned-password list + exposure report (all formats)
+python3 wordsmith.py --auto --domain example.com --scope scope.yaml --defend
+
+# Pick specific formats
+python3 wordsmith.py --auto --domain example.com --defend --defend-format entra,keycloak
+```
+
+**1. A custom banned-password list**, rendered for the places a defender actually loads one:
+
+- `..._banned_entra.txt` — base *terms* for a Microsoft **Entra ID / Azure AD Password Protection** custom banned list (Entra fuzzy-matches substrings, l33t and keyboard variants itself, so it wants stems, not full passwords).
+- `..._banned_keycloak.txt` — full candidate passwords for an **exact-match blocklist** (Keycloak password blacklist, or similar).
+- `..._banned_pwquality.dict` — a word list for **`pam_pwquality` / cracklib**.
+
+**2. An exposure report** (`..._exposure.md` + `.json`): which public sources leak which base terms (provenance), how much of the org-specific candidate space is trivially weak, a weak-pattern breakdown, and prioritized, evidence-backed hardening recommendations. Figures are derived from wordsmith's own candidate generation and are clearly labeled as estimates over the org-specific candidate space — **never invented breach statistics**.
+
+Everything in defensive mode is scope-checked and HMAC-audit-logged like the offensive path.
+
 ---
 
 ## Output Files
@@ -146,7 +180,11 @@ outputs/
 ├── wordsmith_<target>_<timestamp>_top1000.txt   ← Top 1000 by score
 ├── wordsmith_<target>_<timestamp>_names.txt     ← Name-based only
 ├── wordsmith_<target>_<timestamp>.rule          ← Hashcat rule file (--export-rules / --rules-only)
-└── wordsmith_<target>_<timestamp>_seeds.txt     ← Companion seed words for the rule file
+├── wordsmith_<target>_<timestamp>_seeds.txt     ← Companion seed words for the rule file
+├── wordsmith_<target>_<timestamp>_banned_entra.txt      ← Entra ID / Azure AD banned terms (--defend)
+├── wordsmith_<target>_<timestamp>_banned_keycloak.txt   ← Exact-match blocklist (--defend)
+├── wordsmith_<target>_<timestamp>_banned_pwquality.dict ← cracklib / pam_pwquality dict (--defend)
+└── wordsmith_<target>_<timestamp>_exposure.md / .json   ← Exposure report (--defend)
 ```
 
 ---
@@ -159,6 +197,8 @@ wordsmith [options]
   --domain DOMAIN                Target domain
   --company NAME                 Company name (if no domain)
   --scope FILE                   scope.yaml path (default: scope.yaml)
+  --no-scope-i-understand        Run --auto with no valid scope (DANGEROUS;
+                                  disables scope/exclude enforcement)
   --strategies 1,2,3             Enable only these strategies
   --max-size MB                  Max wordlist size in MB (default 100)
   --max-words N                  Max word count (default 5M)
@@ -174,6 +214,8 @@ wordsmith [options]
   --export-rules                 Also export hashcat .rule + seeds files
   --rules-only                   Skip wordlist generation, rules/seeds only
   --rules-tier TIER              basic|standard|exhaustive (default standard)
+  --defend                       Defensive mode: banned-password list + report
+  --defend-format FMT            entra,ad,keycloak,pwquality,all (default all)
   --format json|md|all           Report format
   --auto                         Fully automatic mode
   --resume SESSION_ID            Resume previous session
@@ -203,13 +245,16 @@ wordsmith/
 │   ├── banner.py              ← Amber/gold TUI banner
 │   ├── preflight.py          ← Dependency checker
 │   ├── scope.py              ← Scope enforcement (includes + excludes)
+│   ├── netutil.py            ← Scope-aware HTTP client (TLS, redirect re-check, SSRF guard)
 │   ├── state.py              ← Session state
 │   ├── osint.py              ← OSINT collector
 │   ├── scraper.py            ← Website crawler
 │   ├── mutator.py            ← Mutation engine (13 strategies, streaming)
 │   ├── scoring.py            ← Shared likelihood-scoring heuristic
+│   ├── policy.py             ← Shared password-policy predicate (mutator + generator)
 │   ├── streaming.py          ← Bounded top-K accumulator
 │   ├── rules.py              ← Hashcat rule-file exporter
+│   ├── defense.py            ← Defensive mode: banned list + exposure report
 │   ├── analyzer.py           ← Password policy detector
 │   ├── generator.py          ← Wordlist assembler + writer
 │   ├── report.py             ← JSON/Markdown report generator
@@ -223,8 +268,8 @@ wordsmith/
 ├── locale/
 │   ├── en.json
 │   └── hi.json
-├── tests/                    ← pytest suite (mutator, scope, audit, generator, rules, streaming)
-├── .github/workflows/ci.yml  ← GitHub Actions: pytest across Python 3.10–3.12
+├── tests/                    ← pytest suite (mutator, scope, netutil, audit, generator, rules, defense, streaming, osint)
+├── .github/workflows/ci.yml  ← GitHub Actions: pytest on Linux/Windows/macOS across Python 3.10–3.12
 └── outputs/                  ← Generated wordlists, reports, rule files
 ```
 
@@ -237,7 +282,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-The suite covers mutation strategies and the bounded/streaming accumulator, scope include/exclude enforcement, HMAC audit-chain signing and tamper detection, wordlist scoring/size-limiting, and hashcat rule syntax + faithfulness (that emitted rules actually reproduce what the corresponding mutator strategy produces). Network-dependent OSINT/scraper code is intentionally out of scope for this suite — it isn't mocked yet.
+The suite covers mutation strategies and the bounded/streaming accumulator, scope include/exclude enforcement (including expiry for IP/email and fail-closed on a malformed scope), the scope-aware HTTP client (off-scope redirect/host refusal, SSRF guard, size-capped download), HMAC audit-chain continuity + edit **and trailing-truncation** detection, scoring/policy filtering, hashcat rule validity + the faithful subset, and defensive-mode output. The network layer is exercised via httpx's `MockTransport` (no live calls); a `hashcat --stdout` check runs when a hashcat binary is present, and is skipped otherwise.
 
 ---
 
@@ -249,9 +294,18 @@ Every action wordsmith takes is HMAC-SHA256 chained:
 python3 wordsmith.py --verify-log SESSION_ID
 ```
 
-The chain is signed with a key generated on first use and stored locally at `~/.wordsmith/audit/.hmac_key` (created with owner-only permissions where the OS supports it) — never hardcoded in source. This makes the log tamper-evident against post-hoc edits to the file on disk; it isn't a substitute for OS-level access control, and verifying a log on a different machine requires securely transferring that key file too, the same caveat that applies to any locally-anchored audit trail.
+The chain is signed with a key generated on first use and stored locally at `~/.wordsmith/audit/.hmac_key` (created with owner-only permissions where the OS supports it) — never hardcoded in source. Each entry carries a monotonic sequence number and the previous entry's HMAC, and a small `~/.wordsmith/audit/<session_id>.head` anchor records the latest `(seq, hmac)`. Together these make the log tamper-evident against edits, reordering, mid-file deletion **and trailing truncation**. Reopening a session (resume, or generating a report for a past session) **continues** the chain rather than resetting it, so `--verify-log` stays green across the normal workflow.
 
-Logs themselves are stored in `~/.wordsmith/audit/<session_id>.log`.
+Logs are stored in `~/.wordsmith/audit/<session_id>.log`.
+
+---
+
+## Security model & limitations
+
+- **Audit chain is tamper-*evident*, not tamper-*proof*.** The signing key sits next to the logs (`~/.wordsmith/audit/`), so anyone who can read it can forge the chain — this defends against post-hoc edits by someone without the key, not against the operator. Verifying on another machine needs the key (and, for the truncation check, the `.head`) copied over; a missing key is reported as *"cannot verify"*, never as tampering.
+- **Scope is enforced on every request to the target** — including redirect hops and derived document URLs — with TLS verification on and an SSRF guard that refuses private/loopback/link-local IPs. Fixed third-party APIs that wordsmith queries *about* the target (crt.sh, GitHub, HackerNews, Reddit) are host-allowlisted rather than scope-gated to the target's own domain.
+- **`--auto` fails closed:** a missing or malformed scope file aborts the run unless you pass `--no-scope-i-understand`. Interactive mode warns but lets you proceed. `scope.yaml`'s `exclude` always wins over any broader include, and `restrictions` (`allowed_modules`, `max_wordlist_size_mb`) are enforced.
+- **Defensive-mode figures are estimates** over the org-specific candidate space wordsmith itself generates — not measured breach statistics — and are labeled as such in the report.
 
 ---
 
