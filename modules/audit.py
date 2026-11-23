@@ -1,15 +1,15 @@
-"""HMAC-chained audit log — every action is cryptographically linked.
+"""HMAC-chained audit log - every action is cryptographically linked.
 
 Trust model: the chain is signed with a random key generated on first use and
 persisted locally (see `_key_path()`), alongside a tiny `<session>.head`
 anchor recording the last sequence number and HMAC. Together these make the
-log tamper-evident against post-hoc edits to the log file on disk — including
+log tamper-evident against post-hoc edits to the log file on disk - including
 **trailing truncation**, which a bare forward-chain cannot detect on its own.
 
 This is NOT a substitute for OS-level access control: anyone who can read the
 key file (it sits next to the logs) can forge the whole chain. Verifying a log
-on a different machine requires securely transferring the key file — and, for
-the truncation check, the `.head` file — the same caveat that applies to any
+on a different machine requires securely transferring the key file - and, for
+the truncation check, the `.head` file - the same caveat that applies to any
 locally-anchored audit trail. A missing key is reported as "cannot verify",
 never as tampering.
 """
@@ -34,7 +34,7 @@ AUDIT_DIR = Path.home() / ".wordsmith" / "audit"
 _KEY_LEN = 32
 GENESIS = "0" * 64
 # Keyed by resolved path (not a single global) so that pointing AUDIT_DIR at
-# a different directory — e.g. a tmp_path in tests — can never accidentally
+# a different directory - e.g. a tmp_path in tests - can never accidentally
 # return a stale key cached from a previous AUDIT_DIR.
 _key_cache: dict[str, bytes] = {}
 
@@ -66,7 +66,7 @@ def _load_or_create_key() -> bytes:
     new_key = secrets.token_bytes(_KEY_LEN)
     try:
         # O_BINARY (Windows-only) prevents the C runtime from translating
-        # 0x0A bytes in the random key into 0x0D 0x0A on write — without it
+        # 0x0A bytes in the random key into 0x0D 0x0A on write - without it
         # os.open() defaults to text mode on Windows and silently corrupts
         # any key containing a newline byte.
         binary_flag = getattr(os, "O_BINARY", 0)
@@ -81,7 +81,7 @@ def _load_or_create_key() -> bytes:
             pass  # best-effort on platforms without POSIX permission bits
         key = new_key
     except FileExistsError:
-        # Lost the creation race — another process wrote it first.
+        # Lost the creation race - another process wrote it first.
         key = path.read_bytes()
 
     _key_cache[cache_key] = key
@@ -117,7 +117,7 @@ class AuditLogger:
     breaks the seq/prev_hash chain; trailing truncation is caught by the
     ``.head`` anchor. Reopening an existing log (resume, or generating a
     report for a past session) **continues** the chain instead of resetting
-    it — the previous implementation reset to genesis on every open, which
+    it - the previous implementation reset to genesis on every open, which
     made ``verify`` report tampering on perfectly legitimate logs.
     """
 
@@ -230,7 +230,7 @@ class AuditLogger:
         key = _load_key_readonly()
         if key is None:
             return False, 0, (
-                f"Signing key not found at {_key_path()} — cannot verify this "
+                f"Signing key not found at {_key_path()} - cannot verify this "
                 "log. This is NOT evidence of tampering: copy the key file from "
                 "the machine that created the log and re-run verification."
             )
@@ -297,7 +297,7 @@ class AuditLogger:
                 h_hmac = str(head["last_hmac"])
             except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
                 return True, count, (
-                    f"Chain intact — {count} entries verified "
+                    f"Chain intact - {count} entries verified "
                     "(head anchor unreadable; trailing-truncation check skipped)"
                 )
             if h_seq > final_seq:
@@ -308,12 +308,12 @@ class AuditLogger:
                 )
             if h_seq == final_seq and not _hmac.compare_digest(h_hmac, last_hmac):
                 return False, count, (
-                    "Head/log mismatch at the final entry — log may have been altered"
+                    "Head/log mismatch at the final entry - log may have been altered"
                 )
-            return True, count, f"Chain intact — {count} entries verified (head anchor OK)"
+            return True, count, f"Chain intact - {count} entries verified (head anchor OK)"
 
         return True, count, (
-            f"Chain intact — {count} entries verified "
+            f"Chain intact - {count} entries verified "
             "(no head anchor; trailing truncation not checkable)"
         )
 

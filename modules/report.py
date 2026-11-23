@@ -31,11 +31,13 @@ class ReportGenerator:
         self._audit  = get_logger(session.session_id)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    def generate(self, formats: list[str] = ["json", "md"]) -> dict[str, str]:
+    def generate(self, formats: Optional[list[str]] = None) -> dict[str, str]:
         """
         Generate reports. Returns dict of format → filepath.
         formats: list containing any of ["json", "md", "all"]
         """
+        if formats is None:
+            formats = ["json", "md"]
         if "all" in formats:
             formats = ["json", "md"]
 
@@ -112,7 +114,7 @@ class ReportGenerator:
                 "sha256":           wordlist_sha,
             },
             "mutation_stats": {
-                "strategies_used":  s.strategies_used,
+                "strategies_used":  s.strategies_for_report(),
                 "total_mutations":  len(s.mutated_words),
             },
             "audit_log_path": str(Path.home() / ".wordsmith" / "audit" / f"{s.session_id}.log"),
@@ -194,7 +196,7 @@ class ReportGenerator:
             f"|--------|-------|",
             f"| Total words | {s.final_wordlist_size:,} |",
             f"| Output path | `{s.final_wordlist_path}` |",
-            f"| Strategies used | {len(s.strategies_used)} |",
+            f"| Strategies used | {len(s.strategies_for_report())} |",
             "",
             "## Top Password Candidates (top 20)",
             "",
@@ -208,7 +210,7 @@ class ReportGenerator:
             "## Mutation Statistics",
             "",
         ]
-        for strat in set(s.strategies_used):
+        for strat in set(s.strategies_for_report()):
             lines.append(f"- {strat.replace('_', ' ').title()}")
         lines += [
             "",
@@ -269,7 +271,7 @@ class ReportGenerator:
         t.add_row("Scraped words",    str(len(s.scraped_words)))
         t.add_row("Mutations",        f"{len(s.mutated_words):,}")
         t.add_row("Final wordlist",   f"{s.final_wordlist_size:,} words")
-        t.add_row("Strategies used",  str(len(set(s.strategies_used))))
+        t.add_row("Strategies used",  str(len(set(s.strategies_for_report()))))
         t.add_row("Output file",      str(Path(s.final_wordlist_path).name) if s.final_wordlist_path else "–")
 
         console.print(t)

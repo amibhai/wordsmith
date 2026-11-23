@@ -65,7 +65,11 @@ class BoundedTopK:
 
         if len(self._heap) < self.capacity:
             heapq.heappush(self._heap, entry)
-        elif entry > self._heap[0]:
+        elif score > self._heap[0][0]:
+            # Replace only on a STRICTLY higher score, so equal-score ties keep
+            # the earlier-offered word (as the docstring promises). Comparing
+            # full tuples here evicted on ties because `_counter` increases,
+            # which kept the LATEST tied word — the opposite of documented.
             heapq.heapreplace(self._heap, entry)
 
         return not self.limit_hit

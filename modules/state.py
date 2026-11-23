@@ -38,7 +38,12 @@ class WordsmithSession:
     mutated_words: list[str] = field(default_factory=list)
     final_wordlist_path: str = ""
     final_wordlist_size: int = 0
+    # strategies_used = the user's CONFIG (which strategy numbers to enable);
+    # strategies_applied = the run-record of which strategies actually ran.
+    # These were previously one field, so a second interactive generate read
+    # back strategy *names* where it expected digits and silently ran all 13.
     strategies_used: list[str] = field(default_factory=list)
+    strategies_applied: list[str] = field(default_factory=list)
     policy: dict = field(default_factory=dict)
     scope_file: str = ""
 
@@ -60,6 +65,11 @@ class WordsmithSession:
                     seen.add(low)
                     result.append(w)
         return result
+
+    def strategies_for_report(self) -> list[str]:
+        """Strategy names actually applied in the last run, falling back to the
+        configured list (and tolerating older sessions that only had one)."""
+        return self.strategies_applied or self.strategies_used
 
     def add_keywords(self, words: list[str]) -> None:
         existing = {w.lower() for w in self.target_keywords}

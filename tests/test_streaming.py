@@ -57,3 +57,16 @@ def test_ties_broken_by_insertion_order():
     topk.offer("first", 5)
     topk.offer("second", 5)
     assert topk.results() == ["first", "second"]
+
+
+def test_tie_at_capacity_keeps_earliest_not_latest():
+    """Regression: at capacity, an equal-score newcomer must NOT evict an
+    existing equal-score word. The old code compared full (score, counter)
+    tuples, so the ever-increasing counter made every tie 'greater' and
+    evicted the OLDEST tied word — the opposite of the documented rule."""
+    topk = BoundedTopK(capacity=2)
+    topk.offer("a", 5)
+    topk.offer("b", 5)
+    topk.offer("c", 5)  # tie at capacity — must be rejected, not evict "a"
+    assert topk.results() == ["a", "b"]
+    assert "c" not in topk.results()

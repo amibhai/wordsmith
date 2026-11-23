@@ -47,10 +47,12 @@ class ScopeManager:
         self._exclude_email_patterns: list[str] = []
         self._restrictions: dict = {}
         self._loaded = False
+        self._load_error: Optional[str] = None
 
         if scope_file.exists():
             self._load(scope_file)
         else:
+            self._load_error = f"scope file not found: {scope_file}"
             logger.debug("No scope file at %s", scope_file)
 
     def _load(self, path: Path) -> None:
@@ -87,6 +89,11 @@ class ScopeManager:
                 len(self._exclude_domains), len(self._exclude_ip_networks), path,
             )
         except Exception as exc:
+            # Parse error on a file that DOES exist: stay unloaded and record
+            # why. --auto treats an unloaded scope as fail-closed, so a
+            # malformed file refuses to run rather than silently fail-open.
+            self._loaded = False
+            self._load_error = f"failed to parse {path}: {exc}"
             logger.error("Failed to load scope file %s: %s", path, exc)
 
     # ── Core check ────────────────────────────────────────────────────────────
@@ -138,14 +145,15 @@ class ScopeManager:
                 domain_part == pat.lstrip("@") or target.lower() == pat
                 for pat in self._email_patterns
             ):
-                return True
+                # Expiry applies to every target class, not just domains.
+                return self._check_expiry()
             # Fall through to domain check
             target = domain_part
 
         # IP address check
         try:
             addr = ipaddress.ip_address(target)
-            return any(addr in net for net in self._ip_networks)
+            return any(addr in net for net in self._ip_networks) and self._check_expiry()
         except ValueError:
             pass
 
@@ -202,8 +210,30 @@ class ScopeManager:
         return self._loaded
 
     @property
+    def load_error(self) -> Optional[str]:
+        """Why the scope failed to load (missing / malformed), else None."""
+        return self._load_error
+
+    @property
     def restrictions(self) -> dict:
         return self._restrictions
+
+    def module_allowed(self, name: str) -> bool:
+        """Honor `restrictions.allowed_modules`: if present, only the listed
+        modules may run; if absent/empty, everything is allowed."""
+        allowed = self._restrictions.get("allowed_modules")
+        if not allowed:
+            return True
+        return name in allowed
+
+    def max_wordlist_mb(self, default: float) -> float:
+        """Clamp a requested size to `restrictions.max_wordlist_size_mb`."""
+        cap = self._restrictions.get("max_wordlist_size_mb")
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            return default
+        return min(default, cap) if cap > 0 else default
 
     @property
     def engagement(self) -> dict:
