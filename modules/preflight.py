@@ -64,15 +64,14 @@ OPTIONAL_TOOLS: list[tuple[str, str, str, str, str]] = [
 ]
 
 PIP_PACKAGES: list[tuple[str, str, str]] = [
-    ("requests",     "requests",       "required"),
+    ("httpx",        "httpx",          "required"),
     ("bs4",          "beautifulsoup4", "required"),
     ("rich",         "rich",           "required"),
     ("dns",          "dnspython",      "required"),
     ("whois",        "python-whois",   "required"),
     ("yaml",         "pyyaml",         "required"),
-    ("cryptography", "cryptography",   "required"),
-    ("httpx",        "httpx",          "required"),
     ("pypdf",        "pypdf",          "optional"),
+    ("lxml",         "lxml",           "optional"),
 ]
 
 TOOL_PACKAGES: dict[str, dict[str, Optional[str]]] = {

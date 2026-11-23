@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from pathlib import Path
@@ -24,6 +25,10 @@ console = _banner_console
 
 # Wall-clock budget for the parallel collection phase.
 OSINT_DEADLINE = 120
+# Hard per-call bound for WHOIS. python-whois shells out to the `whois` binary
+# with no timeout; a hanging lookup otherwise kept the thread pool alive past
+# OSINT_DEADLINE (its context-manager exit waits on running workers).
+WHOIS_TIMEOUT = 20
 
 _COMMON_SUBDOMAINS = [
     "www", "mail", "vpn", "remote", "admin", "portal", "dev", "staging",
@@ -149,8 +154,27 @@ class OSINTCollector:
         except ImportError:
             return {"error": "python-whois not installed"}
 
+        # Run the (un-timed) whois call in a daemon thread and bound it with a
+        # join timeout, so a hung lookup can't exceed WHOIS_TIMEOUT. The daemon
+        # won't block interpreter exit if it's still stuck.
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["w"] = whois_lib.whois(domain)
+            except Exception as exc:  # noqa: BLE001 — surfaced below
+                box["err"] = exc
+
+        th = threading.Thread(target=_run, daemon=True)
+        th.start()
+        th.join(WHOIS_TIMEOUT)
+        if th.is_alive():
+            return {"error": f"whois timed out after {WHOIS_TIMEOUT}s"}
+        if "err" in box:
+            return {"error": str(box["err"])}
+
         try:
-            w = whois_lib.whois(domain)
+            w = box.get("w")
             result: dict[str, Any] = {}
 
             def _first(v):

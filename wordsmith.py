@@ -337,6 +337,16 @@ def run_interactive(args: argparse.Namespace) -> int:
     scope_path = Path(args.scope)
     scope_mgr  = ScopeManager(scope_path)
 
+    # CLI overrides also take effect in interactive mode (previously
+    # --strategies and --policy-min/max were silently auto-only).
+    if args.strategies:
+        s.strategies_used = [x.strip() for x in args.strategies.split(",") if x.strip().isdigit()]
+    if args.policy_min or args.policy_max:
+        s.policy.update({
+            "min_length": args.policy_min or 8,
+            "max_length": args.policy_max or 0,
+        })
+
     audit.log("session.start", mode="interactive")
 
     while True:

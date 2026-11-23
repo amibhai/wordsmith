@@ -58,7 +58,7 @@ Invoke-Py -m pip install --upgrade pip -q
 if (Test-Path $Req) {
     Invoke-Py -m pip install -q -r $Req
 } else {
-    Invoke-Py -m pip install -q requests beautifulsoup4 rich dnspython python-whois pyyaml cryptography httpx
+    Invoke-Py -m pip install -q beautifulsoup4 rich dnspython python-whois pyyaml httpx
 }
 
 if ($LASTEXITCODE -ne 0) {
@@ -92,11 +92,11 @@ Write-Host ""
 Write-Host "+--------------------------------------------------------+"
 Write-Host "|  wordsmith installed successfully!                      |"
 Write-Host "|                                                          |"
-Write-Host "|  Quick start:                                           |"
-Write-Host "|    python wordsmith.py                                  |"
-Write-Host "|    python wordsmith.py --preflight                      |"
-Write-Host "|    python wordsmith.py --scope-wizard                   |"
-Write-Host "|    python wordsmith.py --auto --domain example.com      |"
+Write-Host "|  Quick start (uses the shim -> same interpreter as above):"
+Write-Host "|    .\wordsmith.cmd                                       |"
+Write-Host "|    .\wordsmith.cmd --preflight                          |"
+Write-Host "|    .\wordsmith.cmd --scope-wizard                       |"
+Write-Host "|    .\wordsmith.cmd --auto --domain example.com          |"
 Write-Host "|                                                          |"
 Write-Host "|  LEGAL: Use only on systems you own or are               |"
 Write-Host "|  authorized to test. Create scope.yaml first.            |"
